@@ -1,6 +1,6 @@
 {
   "framework": "vite",
-  "installCommand": "npm install",
-  "buildCommand": "npm run build --workspace frontend && node scripts/vercel-copy-dist.cjs",
-  "outputDirectory": "dist"
+  "installCommand": "npm install --prefix frontend",
+  "buildCommand": "npm run build --prefix frontend",
+  "outputDirectory": "frontend/dist"
 }
