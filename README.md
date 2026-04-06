@@ -64,3 +64,31 @@ A full-stack collaborative coding platform for interview practice and pair probl
 - Room state is kept in memory for MVP speed.
 - Judge0 is used for sandboxed code execution.
 - MongoDB model files are included as placeholders for persistence.
+
+## Deployment (Vercel + Heroku)
+
+Use a split deployment:
+
+- Frontend on Vercel
+- Backend on Heroku
+
+### 1. Deploy backend on Heroku
+
+- This repository includes a `Procfile` with:
+   `web: npm run start --workspace backend`
+- Set Heroku environment variables:
+   - `PORT` (Heroku sets this automatically)
+   - `JUDGE0_URL`
+   - `JUDGE0_API_KEY` (optional)
+   - `FRONTEND_ORIGIN` as comma-separated allowed origins, for example:
+      `https://your-app.vercel.app,https://your-app-git-main-username.vercel.app`
+
+### 2. Deploy frontend on Vercel
+
+- This repository includes `vercel.json` to build the frontend from the monorepo.
+- Set Vercel environment variable:
+   - `VITE_BACKEND_URL=https://<your-heroku-app>.herokuapp.com`
+
+### 3. Important runtime note
+
+- Room data is in-memory. Restarting the Heroku dyno clears active rooms.

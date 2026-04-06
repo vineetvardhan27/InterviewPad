@@ -33,15 +33,42 @@ const server = http.createServer(app);
 
 const PORT = Number(process.env.PORT || 4000);
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
+const ALLOWED_ORIGINS = FRONTEND_ORIGIN
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+function isAllowedOrigin(origin) {
+  if (!origin) {
+    return true;
+  }
+  return ALLOWED_ORIGINS.includes(origin);
+}
 
 const io = new Server(server, {
   cors: {
-    origin: FRONTEND_ORIGIN,
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error("Origin not allowed by CORS"));
+    },
     methods: ["GET", "POST"]
   }
 });
 
-app.use(cors({ origin: FRONTEND_ORIGIN }));
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error("Origin not allowed by CORS"));
+    }
+  })
+);
 app.use(express.json({ limit: "200kb" }));
 
 app.get("/health", (_req, res) => {
