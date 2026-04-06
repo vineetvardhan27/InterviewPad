@@ -1,6 +1,6 @@
 {
   "framework": "vite",
   "installCommand": "npm install",
-  "buildCommand": "npm run build --workspace frontend",
-  "outputDirectory": "frontend/dist"
+  "buildCommand": "npm run build --workspace frontend && node -e \"const fs=require('fs'); fs.rmSync('dist',{recursive:true,force:true}); fs.cpSync('frontend/dist','dist',{recursive:true});\"",
+  "outputDirectory": "dist"
 }
