@@ -65,30 +65,58 @@ A full-stack collaborative coding platform for interview practice and pair probl
 - Judge0 is used for sandboxed code execution.
 - MongoDB model files are included as placeholders for persistence.
 
-## Deployment (Vercel + Heroku)
+## Deployment
 
-Use a split deployment:
+This project is a monorepo with `frontend` and `backend` workspaces. You can deploy the frontend to Vercel and the backend to Render (or Heroku). Below are step-by-step instructions for both platforms.
 
-- Frontend on Vercel
-- Backend on Heroku
+**A. Deploy frontend to Vercel**
 
-### 1. Deploy backend on Heroku
+- Create a new Vercel project and point the Project Root to the repository root (the repo contains `vercel.json` configured to build the frontend).
+- In Vercel Project Settings -> Environment Variables, add:
+   - `VITE_BACKEND_URL` = `https://<your-backend-url>` (the backend base URL served over HTTPS)
+- Vercel will run the commands from `vercel.json`:
+   - `installCommand`: `npm install` (runs at repo root)
+   - `buildCommand`: `npm run build` (builds frontend workspace)
+   - `outputDirectory`: `frontend/dist` (served as the static site)
+- Deploy and verify the frontend URL.
 
-- This repository includes a `Procfile` with:
-   `web: npm run start --workspace backend`
-- Set Heroku environment variables:
-   - `PORT` (Heroku sets this automatically)
-   - `JUDGE0_URL`
+**B. Deploy backend to Render**
+
+- Create a new Web Service on Render (recommended) or a Heroku app.
+- Connect the GitHub repo and set the Build Command to:
+   - `npm install --prefix backend && npm run build --prefix backend` (backend has no build step by default; install is sufficient)
+- Set the Start Command to:
+   - `npm run start --workspace backend`
+- Environment variables required:
+   - `JUDGE0_URL` (e.g., `https://ce.judge0.com` or your Judge0 instance)
    - `JUDGE0_API_KEY` (optional)
-   - `FRONTEND_ORIGIN` as comma-separated allowed origins, for example:
-      `https://your-app.vercel.app,https://your-app-git-main-username.vercel.app`
+   - `FRONTEND_ORIGIN` (comma-separated allowed origins, e.g. `https://your-frontend.vercel.app`)
+- Render will provide a `PORT` environment variable automatically.
 
-### 2. Deploy frontend on Vercel
+**C. Quick local sanity checks**
 
-- This repository includes `vercel.json` to build the frontend from the monorepo.
-- Set Vercel environment variable:
-   - `VITE_BACKEND_URL=https://<your-heroku-app>.herokuapp.com`
+- Install dependencies for the whole workspace:
 
-### 3. Important runtime note
+```bash
+npm install
+```
 
-- Room data is in-memory. Restarting the Heroku dyno clears active rooms.
+- Start locally (concurrently runs frontend + backend):
+
+```bash
+npm run dev
+```
+
+- Build frontend only:
+
+```bash
+npm run build --workspace frontend
+```
+
+**D. Notes & troubleshooting**
+
+- If Vercel build fails with `ENOENT: no such file or directory '/vercel/path0/frontend/frontend/package.json'`, ensure Project Root is set correctly — the previous `--prefix` caused a double `frontend/frontend` path. The included `vercel.json` now runs install/build at repository root and serves `frontend/dist`.
+- Ensure `frontend/dist` exists after build; the repository contains `scripts/vercel-copy-dist.cjs` that copies `frontend/dist` to `dist` if you prefer the root `dist` layout.
+- The backend will throw at runtime if `JUDGE0_URL` is not configured; set it before starting.
+
+If you want, I can also add a `backend/.env.example` file and a short `DEPLOYMENT.md` with copy-paste-ready steps. Which would you prefer next?
