@@ -5,6 +5,8 @@ import { LANGUAGES } from "./constants/languages";
 import { API_BASE_URL, socket } from "./lib/socket";
 
 function App() {
+  const normalizeLanguage = (nextLanguage) => (nextLanguage === "c++" ? "cpp" : nextLanguage || "cpp");
+
   const [theme, setTheme] = useState(() => localStorage.getItem("theme") || "light");
   const [username, setUsername] = useState(() => localStorage.getItem("username") || "");
   const [roomId, setRoomId] = useState("");
@@ -13,7 +15,7 @@ function App() {
   const [users, setUsers] = useState([]);
   const [question, setQuestion] = useState("");
 
-  const [language, setLanguage] = useState("python");
+  const [language, setLanguage] = useState("cpp");
   const [code, setCode] = useState("# Write your solution here\n");
   const [stdin, setStdin] = useState("");
   const [stdout, setStdout] = useState("");
@@ -54,7 +56,7 @@ function App() {
       setRoomHost(state.host || "");
       setQuestion(state.question || "");
       setCode(state.code || "");
-      setLanguage(state.language || "python");
+      setLanguage(normalizeLanguage(state.language));
       setUsers(state.users || []);
     };
 
@@ -71,7 +73,7 @@ function App() {
     };
 
     const onLanguageUpdate = (nextLanguage) => {
-      setLanguage(nextLanguage || "python");
+      setLanguage(normalizeLanguage(nextLanguage));
     };
 
     const onError = (message) => {
@@ -104,7 +106,7 @@ function App() {
     setRoomHost(nextRoom.host || "");
     setQuestion(nextRoom.question || "");
     setCode(nextRoom.code || "");
-    setLanguage(nextRoom.language || "python");
+    setLanguage(normalizeLanguage(nextRoom.language));
     setUsers(nextRoom.users || []);
   }
 
@@ -384,7 +386,7 @@ function App() {
             <div className="editor-section">
               <Editor
                 height="100%"
-                language={language === "cpp" ? "cpp" : language}
+                language={language}
                 value={code}
                 onChange={handleCodeChange}
                 theme={theme === "dark" ? "vs-dark" : "vs"}

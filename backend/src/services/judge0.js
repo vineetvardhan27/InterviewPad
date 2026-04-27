@@ -1,5 +1,5 @@
 import axios from "axios";
-import { SUPPORTED_LANGUAGES } from "../config/languages.js";
+import { SUPPORTED_LANGUAGES, normalizeLanguage } from "../config/languages.js";
 
 const JUDGE0_URL = process.env.JUDGE0_URL || "https://ce.judge0.com";
 const JUDGE0_API_KEY = process.env.JUDGE0_API_KEY;
@@ -18,7 +18,8 @@ export async function runCode({ sourceCode, language, stdin = "" }) {
     throw new Error("JUDGE0_URL is not configured");
   }
 
-  const languageConfig = SUPPORTED_LANGUAGES[language];
+  const normalizedLanguage = normalizeLanguage(language);
+  const languageConfig = SUPPORTED_LANGUAGES[normalizedLanguage];
   if (!languageConfig) {
     throw new Error("Unsupported language");
   }

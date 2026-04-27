@@ -8,10 +8,16 @@ import {
   setRoomQuestion,
   setRoomLanguage
 } from "../store/roomStore.js";
-import { isLanguageSupported } from "../config/languages.js";
+import { isLanguageSupported, normalizeLanguage } from "../config/languages.js";
 import { runCode } from "../services/judge0.js";
+import { createRateLimiter } from "../middleware/rateLimit.js";
 
 const router = express.Router();
+const codeRunLimiter = createRateLimiter({
+  windowMs: 60_000,
+  maxRequests: 10,
+  message: "Too many code run requests. Please wait a minute and try again."
+});
 
 router.post("/room/create", (req, res) => {
   const username = req.body?.username || "guest";
@@ -49,23 +55,25 @@ router.post("/room/join", (req, res) => {
   }
 });
 
-router.post("/code/run", async (req, res) => {
+router.post("/code/run", codeRunLimiter, async (req, res) => {
   const { roomId, sourceCode, language, stdin } = req.body || {};
   if (!sourceCode || !language) {
     return res.status(400).json({ message: "sourceCode and language are required" });
   }
 
-  if (!isLanguageSupported(language)) {
+  const normalizedLanguage = normalizeLanguage(language);
+
+  if (!isLanguageSupported(normalizedLanguage)) {
     return res.status(400).json({ message: "Unsupported language" });
   }
 
   if (roomId && getRoom(roomId)) {
     setRoomCode(roomId, sourceCode);
-    setRoomLanguage(roomId, language);
+    setRoomLanguage(roomId, normalizedLanguage);
   }
 
   try {
-    const result = await runCode({ sourceCode, language, stdin: stdin || "" });
+    const result = await runCode({ sourceCode, language: normalizedLanguage, stdin: stdin || "" });
     return res.json(result);
   } catch (error) {
     return res.status(500).json({ message: error.message });

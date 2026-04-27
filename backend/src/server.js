@@ -13,7 +13,7 @@ import {
   setRoomQuestion,
   setRoomLanguage
 } from "./store/roomStore.js";
-import { isLanguageSupported } from "./config/languages.js";
+import { isLanguageSupported, normalizeLanguage } from "./config/languages.js";
 import { runCode } from "./services/judge0.js";
 
 function emitRoomState(target, room) {
@@ -69,6 +69,7 @@ app.use(
     }
   })
 );
+app.set("trust proxy", 1);
 app.use(express.json({ limit: "200kb" }));
 
 app.get("/health", (_req, res) => {
@@ -104,10 +105,12 @@ io.on("connection", (socket) => {
 
   socket.on("set-language", ({ roomId, language }) => {
     try {
-      if (!isLanguageSupported(language)) {
+      const normalizedLanguage = normalizeLanguage(language);
+
+      if (!isLanguageSupported(normalizedLanguage)) {
         throw new Error("Unsupported language");
       }
-      const room = setRoomLanguage(roomId, language);
+      const room = setRoomLanguage(roomId, normalizedLanguage);
       io.to(roomId).emit("language-update", room.language);
     } catch (error) {
       socket.emit("error-message", error.message);
@@ -154,16 +157,18 @@ io.on("connection", (socket) => {
 
   socket.on("run-code", async ({ roomId, sourceCode, language, stdin }) => {
     try {
-      if (!isLanguageSupported(language)) {
+      const normalizedLanguage = normalizeLanguage(language);
+
+      if (!isLanguageSupported(normalizedLanguage)) {
         throw new Error("Unsupported language");
       }
       const room = getRoom(roomId);
       if (room) {
         setRoomCode(roomId, sourceCode);
-        setRoomLanguage(roomId, language);
+        setRoomLanguage(roomId, normalizedLanguage);
       }
 
-      const result = await runCode({ sourceCode, language, stdin: stdin || "" });
+      const result = await runCode({ sourceCode, language: normalizedLanguage, stdin: stdin || "" });
       socket.emit("run-result", result);
     } catch (error) {
       socket.emit("run-result", {

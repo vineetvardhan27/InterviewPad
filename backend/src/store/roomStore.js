@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { DEFAULT_LANGUAGE, isLanguageSupported } from "../config/languages.js";
+import { DEFAULT_LANGUAGE, isLanguageSupported, normalizeLanguage } from "../config/languages.js";
 
 const rooms = new Map();
 
@@ -50,11 +50,13 @@ export function setRoomCode(roomId, code) {
 }
 
 export function setRoomLanguage(roomId, language) {
-  if (!isLanguageSupported(language)) {
+  const normalizedLanguage = normalizeLanguage(language);
+
+  if (!isLanguageSupported(normalizedLanguage)) {
     throw new Error("Unsupported language");
   }
   const room = getRoomOrThrow(roomId);
-  room.language = language;
+  room.language = normalizedLanguage;
   return room;
 }
 
