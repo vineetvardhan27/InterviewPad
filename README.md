@@ -79,6 +79,7 @@ This project is a monorepo with `frontend` and `backend` workspaces. You can dep
    - `buildCommand`: `npm run build` (builds frontend workspace)
    - `outputDirectory`: `frontend/dist` (served as the static site)
 - Deploy and verify the frontend URL.
+- If Vercel still shows `No Output Directory named "dist" found`, open the Vercel project settings and clear any manual `Output Directory` override, or change it to `frontend/dist` so it matches the repo's build output.
 
 **Troubleshooting: "ENOENT ... frontend/frontend/package.json"**
 
