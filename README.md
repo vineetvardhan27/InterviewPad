@@ -67,7 +67,7 @@ A full-stack collaborative coding platform for interview practice and pair probl
 
 ## Deployment
 
-This project is a monorepo with `frontend` and `backend` workspaces. You can deploy the frontend to Vercel and the backend to Render (or Heroku). Below are step-by-step instructions for both platforms.
+This project is a monorepo with `frontend` and `backend` workspaces. You can deploy the frontend to Vercel and the backend to Render. Below are step-by-step instructions for both platforms.
 
 **A. Deploy frontend to Vercel**
 
@@ -82,7 +82,7 @@ This project is a monorepo with `frontend` and `backend` workspaces. You can dep
 
 **B. Deploy backend to Render**
 
-- Create a new Web Service on Render (recommended) or a Heroku app.
+- Create a new Web Service on Render (recommended).
 - Connect the GitHub repo and set the Build Command to:
    - `npm install --prefix backend && npm run build --prefix backend` (backend has no build step by default; install is sufficient)
 - Set the Start Command to:
