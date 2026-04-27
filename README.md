@@ -101,7 +101,8 @@ This project is a monorepo with `frontend` and `backend` workspaces. You can dep
 - Environment variables required:
    - `JUDGE0_URL` (e.g., `https://ce.judge0.com` or your Judge0 instance)
    - `JUDGE0_API_KEY` (optional)
-   - `FRONTEND_ORIGIN` (comma-separated allowed origins, e.g. `https://your-frontend.vercel.app`)
+   - `FRONTEND_ORIGIN` (comma-separated allowed origins, e.g. `https://your-frontend.netlify.app` or `https://your-frontend.vercel.app`)
+- For Socket.IO to work in production, make sure `FRONTEND_ORIGIN` contains your deployed frontend URL exactly, and the frontend points `VITE_BACKEND_URL` to the Render backend URL.
 - Render will provide a `PORT` environment variable automatically.
 
 **C. Quick local sanity checks**

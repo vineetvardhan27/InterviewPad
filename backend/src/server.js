@@ -45,7 +45,7 @@ function isAllowedOrigin(origin) {
   if (!origin) {
     return true;
   }
-  return ALLOWED_ORIGINS.includes(origin);
+  return ALLOWED_ORIGINS.includes(origin) || origin.startsWith("http://localhost:") || origin.startsWith("https://");
 }
 
 const io = new Server(server, {
@@ -57,7 +57,8 @@ const io = new Server(server, {
       }
       callback(new Error("Origin not allowed by CORS"));
     },
-    methods: ["GET", "POST"]
+    methods: ["GET", "POST"],
+    credentials: false
   }
 });
 
@@ -69,7 +70,8 @@ app.use(
         return;
       }
       callback(new Error("Origin not allowed by CORS"));
-    }
+    },
+    credentials: false
   })
 );
 app.set("trust proxy", 1);
