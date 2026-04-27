@@ -67,29 +67,19 @@ A full-stack collaborative coding platform for interview practice and pair probl
 
 ## Deployment
 
-This project is a monorepo with `frontend` and `backend` workspaces. You can deploy the frontend to Vercel and the backend to Render. Below are step-by-step instructions for both platforms.
+This project is set up for Netlify on the frontend and Render on the backend.
 
-**A. Deploy frontend to Vercel**
+**A. Deploy frontend to Netlify**
 
-- Create a new Vercel project and point the Project Root to the repository root (the repo contains `vercel.json` configured to build the frontend).
-- In Vercel Project Settings -> Environment Variables, add:
-   - `VITE_BACKEND_URL` = `https://<your-backend-url>` (the backend base URL served over HTTPS)
-- Vercel will run the commands from `vercel.json`:
-   - `installCommand`: `npm install` (runs at repo root)
-   - `buildCommand`: `npm run build` (builds frontend workspace)
-   - `outputDirectory`: `frontend/dist` (served as the static site)
-- Deploy and verify the frontend URL.
-- If Vercel still shows `No Output Directory named "dist" found`, open the Vercel project settings and clear any manual `Output Directory` override, or change it to `frontend/dist` so it matches the repo's build output.
-
-**Troubleshooting: "ENOENT ... frontend/frontend/package.json"**
-
-- Cause: Vercel's Project Root is already set to `frontend`, but an install command like `npm install --prefix frontend` forces npm to look for `frontend/package.json` inside the already-selected `frontend` folder, producing a duplicated `frontend/frontend` path.
-- Quick fix (recommended):
-   1. Open your Vercel Dashboard and go to the Project Settings for this project.
-   2. In *Build & Development Settings*, ensure the *Install Command* override is turned off (or set to `npm install`).
-   3. In *General* -> *Root Directory*, set the Root to `frontend` (if your React app lives in `frontend`).
-   4. Save and redeploy.
-- Alternative: keep Project Root as repository root and set the Install Command to `npm install --prefix frontend` and the Build Command to `npm run build --prefix frontend`.
+- Create a new Netlify site from this GitHub repo.
+- Set the base directory to `frontend` if Netlify asks for one.
+- Set the build command to:
+   - `npm run build`
+- Set the publish directory to:
+   - `dist`
+- Add the environment variable:
+   - `VITE_BACKEND_URL` = `https://<your-render-backend-url>`
+- Redeploy after saving the settings.
 
 **B. Deploy backend to Render**
 
@@ -101,8 +91,8 @@ This project is a monorepo with `frontend` and `backend` workspaces. You can dep
 - Environment variables required:
    - `JUDGE0_URL` (e.g., `https://ce.judge0.com` or your Judge0 instance)
    - `JUDGE0_API_KEY` (optional)
-   - `FRONTEND_ORIGIN` (comma-separated allowed origins, e.g. `https://your-frontend.netlify.app` or `https://your-frontend.vercel.app`)
-- For Socket.IO to work in production, make sure `FRONTEND_ORIGIN` contains your deployed frontend URL exactly, and the frontend points `VITE_BACKEND_URL` to the Render backend URL.
+   - `FRONTEND_ORIGIN` (comma-separated allowed origins, e.g. `https://your-frontend.netlify.app`)
+- For Socket.IO to work in production, make sure `FRONTEND_ORIGIN` contains your deployed Netlify URL exactly, and the frontend points `VITE_BACKEND_URL` to the Render backend URL.
 - Render will provide a `PORT` environment variable automatically.
 
 **C. Quick local sanity checks**
@@ -125,9 +115,8 @@ npm run dev
 npm run build --workspace frontend
 ```
 
-**D. Notes & troubleshooting**
+**C. Notes & troubleshooting**
 
-- If Vercel build fails with `ENOENT: no such file or directory '/vercel/path0/frontend/frontend/package.json'`, ensure Project Root is set correctly — the previous `--prefix` caused a double `frontend/frontend` path. The included `vercel.json` now runs install/build at repository root and serves `frontend/dist`.
-- Ensure `frontend/dist` exists after build; the repository contains `scripts/vercel-copy-dist.cjs` that copies `frontend/dist` to `dist` if you prefer the root `dist` layout.
+- Make sure `VITE_BACKEND_URL` does not end with a trailing slash. The frontend now normalizes it automatically, but it is still best to set it as `https://<your-render-backend-url>`.
 - The backend will throw at runtime if `JUDGE0_URL` is not configured; set it before starting.
 
