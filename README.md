@@ -80,6 +80,16 @@ This project is a monorepo with `frontend` and `backend` workspaces. You can dep
    - `outputDirectory`: `frontend/dist` (served as the static site)
 - Deploy and verify the frontend URL.
 
+**Troubleshooting: "ENOENT ... frontend/frontend/package.json"**
+
+- Cause: Vercel's Project Root is already set to `frontend`, but an install command like `npm install --prefix frontend` forces npm to look for `frontend/package.json` inside the already-selected `frontend` folder, producing a duplicated `frontend/frontend` path.
+- Quick fix (recommended):
+   1. Open your Vercel Dashboard and go to the Project Settings for this project.
+   2. In *Build & Development Settings*, ensure the *Install Command* override is turned off (or set to `npm install`).
+   3. In *General* -> *Root Directory*, set the Root to `frontend` (if your React app lives in `frontend`).
+   4. Save and redeploy.
+- Alternative: keep Project Root as repository root and set the Install Command to `npm install --prefix frontend` and the Build Command to `npm run build --prefix frontend`.
+
 **B. Deploy backend to Render**
 
 - Create a new Web Service on Render (recommended).
@@ -119,4 +129,3 @@ npm run build --workspace frontend
 - Ensure `frontend/dist` exists after build; the repository contains `scripts/vercel-copy-dist.cjs` that copies `frontend/dist` to `dist` if you prefer the root `dist` layout.
 - The backend will throw at runtime if `JUDGE0_URL` is not configured; set it before starting.
 
-If you want, I can also add a `backend/.env.example` file and a short `DEPLOYMENT.md` with copy-paste-ready steps. Which would you prefer next?
