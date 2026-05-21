@@ -1,12 +1,19 @@
-// Placeholder schema shape for future MongoDB persistence.
-export const ProblemSchemaShape = {
-  title: "string",
-  description: "string",
-  constraints: "string",
-  samples: [
-    {
-      input: "string",
-      output: "string"
-    }
-  ]
-};
+import mongoose from "mongoose";
+
+const problemSchema = new mongoose.Schema(
+  {
+    title: { type: String, required: true },
+    description: { type: String, required: true },
+    constraints: { type: String, default: "" },
+    samples: [
+      {
+        input: { type: String, default: "" },
+        output: { type: String, default: "" }
+      }
+    ]
+  },
+  { timestamps: true }
+);
+
+const Problem = mongoose.model("Problem", problemSchema);
+export default Problem;

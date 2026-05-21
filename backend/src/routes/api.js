@@ -11,6 +11,7 @@ import {
 import { isLanguageSupported, normalizeLanguage } from "../config/languages.js";
 import { runCode } from "../services/judge0.js";
 import { createRateLimiter } from "../middleware/rateLimit.js";
+import { optionalAuth } from "../middleware/auth.js";
 
 const router = express.Router();
 const codeRunLimiter = createRateLimiter({
@@ -19,37 +20,26 @@ const codeRunLimiter = createRateLimiter({
   message: "Too many code run requests. Please wait a minute and try again."
 });
 
-router.post("/room/create", (req, res) => {
-  const username = req.body?.username || "guest";
-  const room = createRoom(username, req.body?.question || "");
-  res.status(201).json({
-    roomId: room.roomId,
-    code: room.code,
-    language: room.language,
-    users: room.users,
-    host: room.host,
-    question: room.question,
-    version: room.version
-  });
+router.post("/room/create", optionalAuth, async (req, res) => {
+  const username = req.user?.username || req.body?.username || "guest";
+  try {
+    const room = await createRoom(username, req.body?.question || "");
+    res.status(201).json(room);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
 });
 
-router.post("/room/join", (req, res) => {
-  const { roomId, username } = req.body || {};
+router.post("/room/join", optionalAuth, async (req, res) => {
+  const { roomId } = req.body || {};
+  const username = req.user?.username || req.body?.username || "guest";
   if (!roomId) {
     return res.status(400).json({ message: "roomId is required" });
   }
 
   try {
-    const room = joinRoom(roomId, username || "guest");
-    return res.json({
-      roomId: room.roomId,
-      code: room.code,
-      language: room.language,
-      users: room.users,
-      host: room.host,
-      question: room.question,
-      version: room.version
-    });
+    const room = await joinRoom(roomId, username);
+    return res.json(room);
   } catch (error) {
     return res.status(404).json({ message: error.message });
   }
@@ -67,9 +57,12 @@ router.post("/code/run", codeRunLimiter, async (req, res) => {
     return res.status(400).json({ message: "Unsupported language" });
   }
 
-  if (roomId && getRoom(roomId)) {
-    setRoomCode(roomId, sourceCode);
-    setRoomLanguage(roomId, normalizedLanguage);
+  if (roomId) {
+    const existing = await getRoom(roomId);
+    if (existing) {
+      await setRoomCode(roomId, sourceCode);
+      await setRoomLanguage(roomId, normalizedLanguage);
+    }
   }
 
   try {
@@ -80,36 +73,28 @@ router.post("/code/run", codeRunLimiter, async (req, res) => {
   }
 });
 
-router.post("/room/reset", (req, res) => {
+router.post("/room/reset", async (req, res) => {
   const { roomId } = req.body || {};
   if (!roomId) {
     return res.status(400).json({ message: "roomId is required" });
   }
 
   try {
-    const room = resetRoom(roomId);
-    return res.json({
-      roomId: room.roomId,
-      code: room.code,
-      language: room.language,
-      users: room.users,
-      host: room.host,
-      question: room.question,
-      version: room.version
-    });
+    const room = await resetRoom(roomId);
+    return res.json(room);
   } catch (error) {
     return res.status(404).json({ message: error.message });
   }
 });
 
-router.post("/room/question", (req, res) => {
+router.post("/room/question", async (req, res) => {
   const { roomId, question } = req.body || {};
   if (!roomId) {
     return res.status(400).json({ message: "roomId is required" });
   }
 
   try {
-    const room = setRoomQuestion(roomId, question || "");
+    const room = await setRoomQuestion(roomId, question || "");
     return res.json({
       roomId: room.roomId,
       question: room.question
