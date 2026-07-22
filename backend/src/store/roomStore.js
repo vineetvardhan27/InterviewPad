@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import mongoose from "mongoose";
 import { DEFAULT_LANGUAGE, isLanguageSupported, normalizeLanguage } from "../config/languages.js";
 import { isDBConnected } from "../config/db.js";
 import RoomModel from "../models/Room.js";
@@ -34,11 +35,12 @@ function memToClient(room) {
 /* ------------------------------------------------------------------ */
 
 export async function createRoom(username = "guest", question = "") {
+  const trimmedUsername = (username || "guest").trim();
   const roomId = randomUUID().slice(0, 8);
   const data = {
     roomId,
-    users: username ? [username] : [],
-    host: username || "guest",
+    users: trimmedUsername ? [trimmedUsername] : [],
+    host: trimmedUsername || "guest",
     question: question || "",
     code: "# Write your solution here\n",
     language: DEFAULT_LANGUAGE,
@@ -58,12 +60,15 @@ export async function createRoom(username = "guest", question = "") {
 
 export async function joinRoom(roomId, username = "guest") {
   if (isDBConnected()) {
-    const doc = await RoomModel.findOne({ roomId });
+    // Use atomic $addToSet to prevent TOCTOU race when REST route
+    // and socket handler both call joinRoom concurrently.
+    const update = username ? { $addToSet: { users: username } } : {};
+    const doc = await RoomModel.findOneAndUpdate(
+      { roomId },
+      update,
+      { returnDocument: 'after' }
+    );
     if (!doc) throw new Error("Room not found");
-    if (username && !doc.users.includes(username)) {
-      doc.users.push(username);
-      await doc.save();
-    }
     return doc.toClient();
   }
 
@@ -87,17 +92,16 @@ export async function setRoomCode(roomId, code) {
   if (isDBConnected()) {
     const doc = await RoomModel.findOneAndUpdate(
       { roomId },
-      { $set: { code }, $inc: { version: 1 } },
-      { new: true }
+      { $set: { code } },
+      { returnDocument: 'after' }
     );
     if (!doc) throw new Error("Room not found");
-    return doc.toClient();
+    return { conflict: false, room: doc.toClient() };
   }
 
   const room = memGetOrThrow(roomId);
   room.code = code;
-  room.version += 1;
-  return memToClient(room);
+  return { conflict: false, room: memToClient(room) };
 }
 
 export async function setRoomLanguage(roomId, language) {
@@ -110,7 +114,7 @@ export async function setRoomLanguage(roomId, language) {
     const doc = await RoomModel.findOneAndUpdate(
       { roomId },
       { $set: { language: normalizedLanguage } },
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!doc) throw new Error("Room not found");
     return doc.toClient();
@@ -126,7 +130,7 @@ export async function setRoomQuestion(roomId, question) {
     const doc = await RoomModel.findOneAndUpdate(
       { roomId },
       { $set: { question: question || "" } },
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!doc) throw new Error("Room not found");
     return doc.toClient();
@@ -145,7 +149,7 @@ export async function resetRoom(roomId) {
         $set: { language: DEFAULT_LANGUAGE, code: "# Write your solution here\n" },
         $inc: { version: 1 }
       },
-      { new: true }
+      { returnDocument: 'after' }
     );
     if (!doc) throw new Error("Room not found");
     return doc.toClient();
@@ -171,24 +175,18 @@ export async function getRoomsCount() {
 
 export async function removeUserFromRoom(roomId, username) {
   if (isDBConnected()) {
-    const doc = await RoomModel.findOne({ roomId });
+    const doc = await RoomModel.findOneAndUpdate(
+      { roomId },
+      { $pull: { users: username } },
+      { returnDocument: 'after' }
+    );
     if (!doc) return null;
-    doc.users = doc.users.filter((u) => u !== username);
-    await doc.save();
-    if (doc.users.length === 0) {
-      await RoomModel.deleteOne({ roomId });
-      return null;
-    }
     return doc.toClient();
   }
 
   const room = memoryRooms.get(roomId);
   if (!room) return null;
   room.users = room.users.filter((u) => u !== username);
-  if (room.users.length === 0) {
-    memoryRooms.delete(roomId);
-    return null;
-  }
   return memToClient(room);
 }
 
@@ -204,21 +202,30 @@ export async function addChatMessage(roomId, sender, text) {
   };
 
   if (isDBConnected()) {
+    console.log(`[addChatMessage] DB Mode: roomId=${roomId} sender=${sender}`);
     const doc = await RoomModel.findOneAndUpdate(
       { roomId },
       { $push: { messages: { sender, text, timestamp: new Date() } } },
-      { new: true }
+      { returnDocument: 'after' }
     );
-    if (!doc) throw new Error("Room not found");
+    if (!doc) {
+      console.error(`[addChatMessage] DB Room not found: roomId=${roomId}`);
+      throw new Error("Room not found");
+    }
     const last = doc.messages[doc.messages.length - 1];
+    if (!last) {
+      console.error(`[addChatMessage] DB failed to push message`);
+      throw new Error("Failed to store message");
+    }
     return {
-      id: last._id.toString(),
-      sender: last.sender,
-      text: last.text,
-      timestamp: last.timestamp.toISOString()
+      id: last._id ? last._id.toString() : new mongoose.Types.ObjectId().toString(),
+      sender: last.sender || sender,
+      text: last.text || text,
+      timestamp: last.timestamp ? last.timestamp.toISOString() : new Date().toISOString()
     };
   }
 
+  console.log(`[addChatMessage] Memory Mode: roomId=${roomId} sender=${sender}`);
   const room = memGetOrThrow(roomId);
   if (!room.messages) room.messages = [];
   const id = randomUUID().slice(0, 12);
@@ -229,4 +236,26 @@ export async function addChatMessage(roomId, sender, text) {
     room.messages = room.messages.slice(-200);
   }
   return entry;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Chat catchup (reconnect)                                           */
+/* ------------------------------------------------------------------ */
+
+export async function getMessagesSince(roomId, afterMessageId) {
+  if (isDBConnected()) {
+    const doc = await RoomModel.findOne({ roomId });
+    if (!doc) return [];
+    const msgs = doc.toClient().messages;
+    if (!afterMessageId) return msgs;
+    const idx = msgs.findIndex((m) => m.id === afterMessageId);
+    return idx === -1 ? msgs : msgs.slice(idx + 1);
+  }
+
+  const room = memoryRooms.get(roomId);
+  if (!room || !room.messages) return [];
+  const msgs = room.messages.map((m) => ({ ...m }));
+  if (!afterMessageId) return msgs;
+  const idx = msgs.findIndex((m) => m.id === afterMessageId);
+  return idx === -1 ? msgs : msgs.slice(idx + 1);
 }

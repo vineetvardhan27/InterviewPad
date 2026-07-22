@@ -20,7 +20,26 @@ const userSchema = new mongoose.Schema(
     },
     passwordHash: {
       type: String,
-      required: true
+      required: false
+    },
+    googleId: {
+      type: String,
+      unique: true,
+      sparse: true
+    },
+    authProvider: {
+      type: String,
+      enum: ["local", "google"],
+      default: "local"
+    },
+    picture: {
+      type: String
+    },
+    role: {
+      type: String,
+      enum: ['interviewer', 'candidate'],
+      required: true,
+      default: 'candidate'
     }
   },
   { timestamps: true }
@@ -39,6 +58,9 @@ userSchema.methods.toPublic = function () {
     id: this._id.toString(),
     username: this.username,
     email: this.email,
+    role: this.role,
+    picture: this.picture || null,
+    authProvider: this.authProvider || "local",
     createdAt: this.createdAt
   };
 };

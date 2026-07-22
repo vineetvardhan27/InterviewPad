@@ -11,7 +11,7 @@ import {
 import { isLanguageSupported, normalizeLanguage } from "../config/languages.js";
 import { runCode } from "../services/judge0.js";
 import { createRateLimiter } from "../middleware/rateLimit.js";
-import { optionalAuth } from "../middleware/auth.js";
+import { optionalAuth, requireAuth } from "../middleware/auth.js";
 
 const router = express.Router();
 const codeRunLimiter = createRateLimiter({
@@ -21,6 +21,10 @@ const codeRunLimiter = createRateLimiter({
 });
 
 router.post("/room/create", optionalAuth, async (req, res) => {
+  if (req.user && req.user.role !== 'interviewer') {
+    return res.status(403).json({ message: "Only interviewers can create rooms." });
+  }
+
   const username = req.user?.username || req.body?.username || "guest";
   try {
     const room = await createRoom(username, req.body?.question || "");
@@ -60,7 +64,7 @@ router.post("/code/run", codeRunLimiter, async (req, res) => {
   if (roomId) {
     const existing = await getRoom(roomId);
     if (existing) {
-      await setRoomCode(roomId, sourceCode);
+      const { room: _updated } = await setRoomCode(roomId, sourceCode);
       await setRoomLanguage(roomId, normalizedLanguage);
     }
   }

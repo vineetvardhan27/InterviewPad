@@ -6,6 +6,7 @@ import { Server } from "socket.io";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "url";
+import * as Y from "yjs";
 
 import { connectDB } from "./config/db.js";
 import apiRouter from "./routes/api.js";
@@ -19,7 +20,8 @@ import {
   setRoomQuestion,
   setRoomLanguage,
   removeUserFromRoom,
-  addChatMessage
+  addChatMessage,
+  getMessagesSince
 } from "./store/roomStore.js";
 import { isLanguageSupported, normalizeLanguage } from "./config/languages.js";
 import { runCode } from "./services/judge0.js";
@@ -31,20 +33,39 @@ import { verifyToken } from "./middleware/auth.js";
 const socketMeta = new Map(); // socketId → { roomId, username }
 
 /* ------------------------------------------------------------------ */
-/*  Cursor presence tracking                                           */
+/*  Yjs document management                                            */
 /* ------------------------------------------------------------------ */
-const cursorPositions = new Map(); // roomId → Map<username, { line, column, color }>
+const yjsDocs = new Map();   // roomId → Y.Doc
 
-const CURSOR_COLORS = [
-  "#e06c75", "#61afef", "#98c379", "#c678dd", "#e5c07b",
-  "#56b6c2", "#be5046", "#d19a66", "#7ec699", "#c792ea"
-];
-
-function getCursorColor(roomId, username) {
-  const roomCursors = cursorPositions.get(roomId);
-  const idx = roomCursors ? roomCursors.size % CURSOR_COLORS.length : 0;
-  return CURSOR_COLORS[idx];
+function getOrCreateYDoc(roomId, seedCode = "") {
+  if (yjsDocs.has(roomId)) return yjsDocs.get(roomId);
+  const doc = new Y.Doc();
+  if (seedCode) {
+    const txt = doc.getText("code");
+    txt.insert(0, seedCode);
+  }
+  yjsDocs.set(roomId, doc);
+  return doc;
 }
+
+function destroyYDoc(roomId) {
+  const doc = yjsDocs.get(roomId);
+  if (doc) {
+    doc.destroy();
+    yjsDocs.delete(roomId);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Graceful disconnect timers                                         */
+/* ------------------------------------------------------------------ */
+const GRACE_PERIOD_MS = 60_000; // 60 seconds
+const disconnectTimers = new Map(); // "roomId::username" → timeout id
+
+function graceKey(roomId, username) {
+  return `${roomId}::${username}`;
+}
+
 
 function emitRoomState(target, room) {
   target.emit("room-state", {
@@ -76,7 +97,12 @@ function isAllowedOrigin(origin) {
   if (!origin) {
     return true;
   }
-  return ALLOWED_ORIGINS.includes(origin) || origin.startsWith("http://localhost:") || origin.startsWith("https://");
+  return (
+    ALLOWED_ORIGINS.includes(origin) ||
+    origin.startsWith("http://localhost:") ||
+    origin.startsWith("http://127.0.0.1:") ||
+    origin.startsWith("https://")
+  );
 }
 
 const io = new Server(server, {
@@ -120,7 +146,7 @@ app.use("/api", apiRouter);
 
 app.get("/health", async (_req, res) => {
   const count = await getRoomsCount();
-  res.json({ status: "ok", rooms: count });
+  res.json({ status: "ok", rooms: count, uptime: process.uptime() });
 });
 
 if (process.env.NODE_ENV === "production" || fs.existsSync(frontendDist)) {
@@ -129,6 +155,20 @@ if (process.env.NODE_ENV === "production" || fs.existsSync(frontendDist)) {
     res.sendFile(path.join(frontendDist, "index.html"));
   });
 }
+
+/* ------------------------------------------------------------------ */
+/*  Periodic Yjs → Mongo snapshot (every 10 seconds)                   */
+/* ------------------------------------------------------------------ */
+setInterval(async () => {
+  for (const [roomId, doc] of yjsDocs.entries()) {
+    try {
+      const code = doc.getText("code").toString();
+      await setRoomCode(roomId, code);
+    } catch (e) {
+      // Room may have been deleted — ignore
+    }
+  }
+}, 10_000);
 
 /* ------------------------------------------------------------------ */
 /*  Socket.io handlers                                                 */
@@ -149,45 +189,118 @@ io.on("connection", (socket) => {
   }
 
   /* ---------- Join room ---------- */
-  socket.on("join-room", async ({ roomId, username }) => {
+  socket.on("join-room", async ({ roomId, username, lastSeenMessageId }) => {
+    console.log(`[DEBUG join-room server] Received join-room event for roomId: "${roomId}", username: "${username}", socketId: ${socket.id}`);
     try {
-      const name = socket.data.username || username || "guest";
+      const name = (socket.data.username || username || "guest").trim();
       socket.data.username = name;
-      const room = await joinRoom(roomId, name);
+      console.log(`[join-room] socket=${socket.id} name=${name} roomId=${roomId} authenticated=${socket.data.authenticated}`);
+
+      // Cancel any pending disconnect timer for this user
+      const gk = graceKey(roomId, name);
+      if (disconnectTimers.has(gk)) {
+        clearTimeout(disconnectTimers.get(gk));
+        disconnectTimers.delete(gk);
+        console.log(`[join-room] Cancelled grace timer for ${name} — reconnect within window`);
+        // Notify room that user is back
+        socket.to(roomId).emit("user-reconnected", { username: name });
+      }
+
+      // Idempotent: skip joinRoom if user was already added by REST route
+      const existingRoom = await getRoom(roomId);
+      if (!existingRoom) throw new Error("Room not found");
+      const room = existingRoom.users.includes(name)
+        ? existingRoom
+        : await joinRoom(roomId, name);
+      console.log(`[join-room] after joinRoom: users=${JSON.stringify(room.users)} host=${room.host}`);
+
       socket.join(roomId);
+      const roomCount = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+      console.log(`[join-room] socket ${socket.id} joined room ${roomId}, room size: ${roomCount}`);
 
       // Track for disconnect cleanup
       socketMeta.set(socket.id, { roomId, username: name });
+      console.log(`[join-room] socketMeta updated. DB users: ${room.users.length}, Live sockets: ${roomCount}`);
 
-      // Initialize cursor tracking for room
-      if (!cursorPositions.has(roomId)) {
-        cursorPositions.set(roomId, new Map());
-      }
-
+      // Emit room state (metadata, users, language, question, etc.)
       emitRoomState(socket, room);
       io.to(roomId).emit("users-update", room.users);
+      console.log(`[join-room] emitted users-update:`, JSON.stringify(room.users));
 
-      // Send existing cursor positions to the joining user
-      const roomCursors = cursorPositions.get(roomId);
-      if (roomCursors && roomCursors.size > 0) {
-        const cursors = Object.fromEntries(roomCursors);
-        socket.emit("cursors-sync", cursors);
+      // ---- Yjs sync: send full doc state to the joining client ----
+      const doc = getOrCreateYDoc(roomId, room.code);
+      const sv = Y.encodeStateVector(doc);
+      const update = Y.encodeStateAsUpdate(doc);
+      socket.emit("yjs-sync-full", {
+        update: Buffer.from(update).toString("base64")
+      });
+
+      // ---- Chat catchup: send missed messages ----
+      if (lastSeenMessageId) {
+        try {
+          const missed = await getMessagesSince(roomId, lastSeenMessageId);
+          if (missed.length > 0) {
+            socket.emit("chat-catchup", missed);
+          }
+        } catch (e) {
+          console.error(`[join-room] chat catchup error:`, e.message);
+        }
       }
     } catch (error) {
+      console.error(`[join-room] ERROR:`, error.message);
       socket.emit("error-message", error.message);
     }
   });
 
-  /* ---------- Code change ---------- */
-  socket.on("code-change", async ({ roomId, code }) => {
+  socket.on("yjs-update", async ({ roomId, update }) => {
     try {
-      const room = await setRoomCode(roomId, code);
-      socket.to(roomId).emit("code-update", {
-        code: room.code,
-        version: room.version
-      });
-    } catch (error) {
-      socket.emit("error-message", error.message);
+      const roomSize = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+      console.log(`[DEBUG yjs-update server] Received yjs-update for roomId: "${roomId}", updateB64Len: ${update?.length}, socketsInRoom: ${roomSize}, senderSocketId: ${socket.id}`);
+      let doc = yjsDocs.get(roomId);
+      if (!doc) {
+        const room = await getRoom(roomId);
+        if (room) {
+          doc = getOrCreateYDoc(roomId, room.code);
+        }
+      }
+      if (!doc) {
+        console.log(`[DEBUG yjs-update server] ERROR: No doc found for roomId: "${roomId}"`);
+        return;
+      }
+      const b64 = Buffer.from(update, "base64");
+      const uint8 = new Uint8Array(b64.buffer, b64.byteOffset, b64.length);
+      Y.applyUpdate(doc, uint8);
+      console.log(`[DEBUG yjs-update server] Rebroadcasting yjs-update to room: "${roomId}" (excluding sender ${socket.id}). Doc text len: ${doc.getText("code").toString().length}`);
+      // Broadcast to all OTHER sockets in the room
+      socket.to(roomId).emit("yjs-update", { roomId, update });
+    } catch (e) {
+      console.error("[yjs-update] Error:", e.message);
+    }
+  });
+
+  socket.on("yjs-awareness", ({ roomId, update }) => {
+    try {
+      socket.to(roomId).emit("yjs-awareness", { update });
+    } catch (e) {
+      console.error("[yjs-awareness] Error:", e.message);
+    }
+  });
+
+  socket.on("yjs-sync-request", async ({ roomId }) => {
+    try {
+      let doc = yjsDocs.get(roomId);
+      if (!doc) {
+        const room = await getRoom(roomId);
+        if (room) {
+          doc = getOrCreateYDoc(roomId, room.code);
+        }
+      }
+      if (doc) {
+        const state = Y.encodeStateAsUpdate(doc);
+        socket.emit("yjs-sync-full", { update: Buffer.from(state).toString("base64") });
+      }
+    } catch (e) {
+      console.error("[yjs-sync-request] Error:", e.message);
     }
   });
 
@@ -212,12 +325,17 @@ io.on("connection", (socket) => {
       if (!currentRoom) {
         throw new Error("Room not found");
       }
-      if (currentRoom.host !== socket.data.username) {
+      const normalizedHost = (currentRoom.host || "").trim().toLowerCase();
+      const normalizedUser = (socket.data.username || "").trim().toLowerCase();
+      console.log(`[question-change] host="${normalizedHost}" user="${normalizedUser}" match=${normalizedHost === normalizedUser}`);
+      if (normalizedHost !== normalizedUser) {
         throw new Error("Only interviewer can edit question");
       }
       const room = await setRoomQuestion(roomId, question || "");
       io.to(roomId).emit("question-update", room.question);
+      console.log(`[question-change] broadcasted question to room ${roomId}, question length=${(room.question || "").length}`);
     } catch (error) {
+      console.error(`[question-change] ERROR:`, error.message);
       socket.emit("error-message", error.message);
     }
   });
@@ -226,9 +344,12 @@ io.on("connection", (socket) => {
   socket.on("reset-room", async ({ roomId }) => {
     try {
       const room = await resetRoom(roomId);
-      io.to(roomId).emit("code-update", {
-        code: room.code,
-        version: room.version
+      // Reset the Yjs doc
+      destroyYDoc(roomId);
+      const doc = getOrCreateYDoc(roomId, room.code);
+      const update = Y.encodeStateAsUpdate(doc);
+      io.to(roomId).emit("yjs-sync-full", {
+        update: Buffer.from(update).toString("base64")
       });
       io.to(roomId).emit("language-update", room.language);
       emitRoomState(io.to(roomId), room);
@@ -244,13 +365,21 @@ io.on("connection", (socket) => {
       if (!isLanguageSupported(normalizedLanguage)) {
         throw new Error("Unsupported language");
       }
-      const room = await getRoom(roomId);
-      if (room) {
-        await setRoomCode(roomId, sourceCode);
-        await setRoomLanguage(roomId, normalizedLanguage);
+      // Use Yjs doc as source of truth if available
+      let codeToRun = sourceCode;
+      const doc = yjsDocs.get(roomId);
+      if (doc) {
+        codeToRun = doc.getText("code").toString();
+      }
+      // Snapshot to Mongo
+      if (roomId) {
+        try {
+          await setRoomCode(roomId, codeToRun);
+          await setRoomLanguage(roomId, normalizedLanguage);
+        } catch (_) { /* ignore snapshot errors */ }
       }
 
-      const result = await runCode({ sourceCode, language: normalizedLanguage, stdin: stdin || "" });
+      const result = await runCode({ sourceCode: codeToRun, language: normalizedLanguage, stdin: stdin || "" });
       socket.emit("run-result", result);
     } catch (error) {
       socket.emit("run-result", {
@@ -262,44 +391,23 @@ io.on("connection", (socket) => {
     }
   });
 
-  /* ---------- Cursor presence ---------- */
-  socket.on("cursor-move", ({ roomId, position }) => {
-    const username = socket.data.username;
-    if (!username || !roomId) return;
-
-    if (!cursorPositions.has(roomId)) {
-      cursorPositions.set(roomId, new Map());
-    }
-    const roomCursors = cursorPositions.get(roomId);
-    const color = roomCursors.get(username)?.color || getCursorColor(roomId, username);
-    roomCursors.set(username, { ...position, color, username });
-
-    socket.to(roomId).emit("cursor-update", {
-      username,
-      position: { ...position, color }
-    });
-  });
-
-  /* ---------- Selection presence ---------- */
-  socket.on("selection-change", ({ roomId, selection }) => {
-    const username = socket.data.username;
-    if (!username || !roomId) return;
-
-    socket.to(roomId).emit("selection-update", {
-      username,
-      selection
-    });
-  });
+  /* ---------- Manual cursor tracking removed in favor of y-protocols/awareness ---------- */
 
   /* ---------- Chat system ---------- */
   socket.on("chat-message", async ({ roomId, text }) => {
     const username = socket.data.username;
-    if (!username || !roomId || !text?.trim()) return;
+    console.log(`[chat-message] socket=${socket.id} username=${username} roomId=${roomId} text="${text}"`);
+    if (!username || !roomId || !text?.trim()) {
+      console.warn(`[chat-message] Guard failed: username=${username} roomId=${roomId} text="${text}"`);
+      return;
+    }
 
     try {
       const message = await addChatMessage(roomId, username, text.trim());
+      console.log(`[chat-message] Message stored successfully:`, JSON.stringify(message));
       io.to(roomId).emit("chat-update", message);
     } catch (error) {
+      console.error(`[chat-message] ERROR:`, error.message);
       socket.emit("error-message", error.message);
     }
   });
@@ -311,41 +419,82 @@ io.on("connection", (socket) => {
     socket.to(roomId).emit("chat-typing-update", { username, isTyping });
   });
 
-  /* ---------- Disconnect cleanup ---------- */
-  socket.on("disconnect", async () => {
+  /* ---------- Disconnect — graceful with 60s window ---------- */
+  socket.on("disconnect", () => {
     const meta = socketMeta.get(socket.id);
     if (!meta) return;
 
     const { roomId, username } = meta;
     socketMeta.delete(socket.id);
 
-    try {
-      // Remove user from room
-      const updatedRoom = await removeUserFromRoom(roomId, username);
+    const roomCount = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+    console.log(`[disconnect] socket=${socket.id} username=${username} roomId=${roomId}. Live sockets remaining: ${roomCount}`);
 
-      // Remove cursor data
-      const roomCursors = cursorPositions.get(roomId);
-      if (roomCursors) {
-        roomCursors.delete(username);
-        if (roomCursors.size === 0) {
-          cursorPositions.delete(roomId);
-        }
-      }
-
-      if (updatedRoom) {
-        // Room still has users — notify them
-        io.to(roomId).emit("users-update", updatedRoom.users);
-        io.to(roomId).emit("cursor-remove", { username });
-        io.to(roomId).emit("chat-update", {
-          id: `sys-${Date.now()}`,
-          sender: "system",
-          text: `${username} left the room`,
-          timestamp: new Date().toISOString()
-        });
-      }
-    } catch (error) {
-      console.error("Disconnect cleanup error:", error.message);
+    // Check if user has another live socket in the same room
+    const hasOtherSocket = Array.from(socketMeta.values()).some(
+      (m) => m.roomId === roomId && m.username === username
+    );
+    if (hasOtherSocket) {
+      console.log(`[disconnect] User ${username} has another socket in room ${roomId}. No action needed.`);
+      return;
     }
+
+    // Notify room: user is disconnecting (grace period starts)
+    io.to(roomId).emit("user-disconnecting", { username });
+    console.log(`[disconnect] Grace period started for ${username} in ${roomId} (${GRACE_PERIOD_MS / 1000}s)`);
+
+    // Start grace period timer
+    const gk = graceKey(roomId, username);
+    const timer = setTimeout(async () => {
+      disconnectTimers.delete(gk);
+
+      // Double-check user hasn't reconnected during the timeout
+      const reconnected = Array.from(socketMeta.values()).some(
+        (m) => m.roomId === roomId && m.username === username
+      );
+      if (reconnected) {
+        console.log(`[disconnect-timeout] User ${username} reconnected. Skipping removal.`);
+        return;
+      }
+
+      console.log(`[disconnect-timeout] Grace period expired for ${username} in ${roomId}. Removing.`);
+
+      try {
+        // Remove user from room
+        const updatedRoom = await removeUserFromRoom(roomId, username);
+
+        const newRoomCount = io.sockets.adapter.rooms.get(roomId)?.size || 0;
+        console.log(`[disconnect-cleanup] Removed ${username}. DB users: ${updatedRoom ? updatedRoom.users.length : 0}, Live sockets: ${newRoomCount}`);
+
+        if (updatedRoom) {
+          // Room still has users — notify them
+          io.to(roomId).emit("users-update", updatedRoom.users);
+          io.to(roomId).emit("chat-update", {
+            id: `sys-${Date.now()}`,
+            sender: "system",
+            text: `${username} left the room`,
+            timestamp: new Date().toISOString()
+          });
+        }
+
+        // If room is now empty, snapshot Yjs doc to Mongo and destroy
+        if (!updatedRoom || updatedRoom.users.length === 0) {
+          const doc = yjsDocs.get(roomId);
+          if (doc) {
+            try {
+              const code = doc.getText("code").toString();
+              await setRoomCode(roomId, code);
+            } catch (_) { /* ignore */ }
+            destroyYDoc(roomId);
+            console.log(`[disconnect-cleanup] Room ${roomId} empty — Yjs doc destroyed, code snapshot saved.`);
+          }
+        }
+      } catch (error) {
+        console.error("Disconnect cleanup error:", error.message);
+      }
+    }, GRACE_PERIOD_MS);
+
+    disconnectTimers.set(gk, timer);
   });
 });
 

@@ -59,10 +59,10 @@ roomSchema.methods.toClient = function () {
     question: this.question,
     version: this.version,
     messages: this.messages.map((m) => ({
-      id: m._id.toString(),
+      id: m._id ? m._id.toString() : new mongoose.Types.ObjectId().toString(),
       sender: m.sender,
       text: m.text,
-      timestamp: m.timestamp.toISOString()
+      timestamp: m.timestamp ? m.timestamp.toISOString() : new Date().toISOString()
     }))
   };
 };

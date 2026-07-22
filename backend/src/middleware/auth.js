@@ -24,7 +24,7 @@ export function requireAuth(req, res, next) {
   try {
     const token = header.slice(7);
     const decoded = verifyToken(token);
-    req.user = { id: decoded.id, username: decoded.username, email: decoded.email };
+    req.user = { id: decoded.id, username: decoded.username, email: decoded.email, role: decoded.role };
     return next();
   } catch {
     return res.status(401).json({ message: "Invalid or expired token" });
@@ -40,7 +40,7 @@ export function optionalAuth(req, _res, next) {
     try {
       const token = header.slice(7);
       const decoded = verifyToken(token);
-      req.user = { id: decoded.id, username: decoded.username, email: decoded.email };
+      req.user = { id: decoded.id, username: decoded.username, email: decoded.email, role: decoded.role };
     } catch {
       // Invalid token — continue as guest
     }

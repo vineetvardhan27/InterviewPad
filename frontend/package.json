@@ -10,10 +10,17 @@
   },
   "dependencies": {
     "@monaco-editor/react": "^4.6.0",
+    "@playwright/test": "^1.61.0",
+    "@react-oauth/google": "^0.13.5",
     "axios": "^1.8.2",
+    "lucide-react": "^1.25.0",
+    "playwright": "^1.61.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "socket.io-client": "^4.8.1"
+    "socket.io-client": "^4.8.1",
+    "y-monaco": "^0.1.6",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.31"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",

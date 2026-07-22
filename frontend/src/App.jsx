@@ -1,52 +1,47 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
-import Editor from "@monaco-editor/react";
+import { Sun, Moon } from "lucide-react";
 import axios from "axios";
-import { LANGUAGES } from "./constants/languages";
+import { MonacoBinding } from "y-monaco";
+import * as Y from "yjs";
 import { API_BASE_URL, socket, getAuthHeaders, reconnectSocket } from "./lib/socket";
+import {
+  initYDoc,
+  applyFullSync,
+  applyRemoteUpdate,
+  applyAwarenessUpdate,
+  setAwarenessUser,
+  broadcastAwareness,
+  requestResync,
+  getYText,
+  getYDoc,
+  getAwareness,
+  getCode,
+  destroyYDoc
+} from "./lib/yjsProvider";
+
+import AuthScreen from "./components/AuthScreen";
+import LandingPage from "./components/LandingPage";
+import Sidebar from "./components/Sidebar";
+import EditorPanel from "./components/EditorPanel";
+import ChatPanel from "./components/ChatPanel";
+
+const normalizeLanguage = (l) => (l === "c++" ? "cpp" : l || "cpp");
 
 /* ------------------------------------------------------------------ */
-/*  Cursor decoration helpers                                          */
-/* ------------------------------------------------------------------ */
-function buildCursorDecorations(remoteCursors, monacoRef) {
-  if (!monacoRef.current) return [];
-  const decorations = [];
-  for (const [username, data] of Object.entries(remoteCursors)) {
-    if (!data.line || !data.column) continue;
-    decorations.push({
-      range: new monacoRef.current.Range(data.line, data.column, data.line, data.column + 1),
-      options: {
-        className: `remote-cursor`,
-        beforeContentClassName: `remote-cursor-line`,
-        hoverMessage: { value: username },
-        stickiness: 1,
-        after: {
-          content: ` ${username}`,
-          inlineClassName: "remote-cursor-label",
-          cursorStops: 0
-        }
-      }
-    });
-  }
-  return decorations;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Main App                                                           */
+/*  App — State manager & socket orchestrator                          */
 /* ------------------------------------------------------------------ */
 function App() {
-  const normalizeLanguage = (l) => (l === "c++" ? "cpp" : l || "cpp");
-
-  // Theme
+  // ---- Theme ----
   const [theme, setTheme] = useState(() => localStorage.getItem("theme") || "light");
 
-  // Auth state
-  const [authMode, setAuthMode] = useState("login"); // login | register | none
+  // ---- Auth state ----
+  const [authMode, setAuthMode] = useState("landing");
   const [authUser, setAuthUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [authError, setAuthError] = useState("");
-  const [authForm, setAuthForm] = useState({ username: "", email: "", password: "" });
+  const [authForm, setAuthForm] = useState({ username: "", email: "", password: "", role: "candidate" });
 
-  // Room state
+  // ---- Room state ----
   const [username, setUsername] = useState(() => localStorage.getItem("username") || "");
   const [roomId, setRoomId] = useState("");
   const [joinedRoomId, setJoinedRoomId] = useState("");
@@ -54,7 +49,7 @@ function App() {
   const [users, setUsers] = useState([]);
   const [question, setQuestion] = useState("");
 
-  // Editor state
+  // ---- Editor state ----
   const [language, setLanguage] = useState("cpp");
   const [code, setCode] = useState("# Write your solution here\n");
   const [stdin, setStdin] = useState("");
@@ -65,88 +60,238 @@ function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [sessionMessage, setSessionMessage] = useState("");
 
-  // Chat state
+  // ---- Chat state ----
   const [messages, setMessages] = useState([]);
   const [chatInput, setChatInput] = useState("");
   const [chatOpen, setChatOpen] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
   const [typingUsers, setTypingUsers] = useState([]);
-  const chatEndRef = useRef(null);
-  const typingTimeoutRef = useRef(null);
 
-  // Cursor presence state
-  const [remoteCursors, setRemoteCursors] = useState({});
+  // ---- Connection state ----
+  const [connectionStatus, setConnectionStatus] = useState("connected");
+  const [reconnectingUsers, setReconnectingUsers] = useState(new Set());
+
+  // ---- Refs ----
+  const chatEndRef = useRef(null);
+  const chatOpenRef = useRef(chatOpen);
+  const joinedRoomIdRef = useRef(joinedRoomId);
+  const usernameRef = useRef(username);
+  const typingTimeoutRef = useRef(null);
   const editorRef = useRef(null);
   const monacoRef = useRef(null);
-  const decorationsRef = useRef([]);
+  const bindingRef = useRef(null); // MonacoBinding instance
+  const [isSynced, setIsSynced] = useState(false); // Track if we've received full Yjs sync
+  const [editorMounted, setEditorMounted] = useState(false); // Track if Monaco is mounted
+  const [yjsStatus, setYjsStatus] = useState("idle"); // "idle" | "syncing" | "synced" | "error"
 
+  // ---- Computed ----
   const canCollaborate = useMemo(() => Boolean(joinedRoomId), [joinedRoomId]);
-  const isHost = Boolean(canCollaborate && roomHost && username && roomHost === username);
+  const isHost = useMemo(() => {
+    if (!canCollaborate) return false;
+    if (authUser && authUser.role === 'interviewer') return true;
+    return roomHost && username && roomHost.trim().toLowerCase() === username.trim().toLowerCase();
+  }, [canCollaborate, authUser, roomHost, username]);
   const inviteLink = useMemo(
-    () => (joinedRoomId ? `${window.location.origin}${window.location.pathname}?room=${joinedRoomId}` : ""),
+    () =>
+      joinedRoomId
+        ? `${window.location.origin}${window.location.pathname}?room=${joinedRoomId}`
+        : "",
     [joinedRoomId]
   );
-  const statusClass = useMemo(() => status.toLowerCase().replace(/[^a-z0-9]+/g, "-"), [status]);
+  const statusClass = useMemo(
+    () => status.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+    [status]
+  );
 
-  /* ---- Theme persistence ---- */
+  // Helper: get last message ID for chat catchup
+  const messagesRef = useRef(messages);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+
+  const getLastMessageId = useCallback(() => {
+    const msgs = messagesRef.current;
+    if (msgs.length === 0) return null;
+    return msgs[msgs.length - 1]?.id || null;
+  }, []);
+
+  /* ================================================================ */
+  /*  EFFECTS                                                          */
+  /* ================================================================ */
+
+  // Keep refs in sync
+  useEffect(() => { chatOpenRef.current = chatOpen; }, [chatOpen]);
+  useEffect(() => { joinedRoomIdRef.current = joinedRoomId; }, [joinedRoomId]);
+  useEffect(() => { usernameRef.current = username; }, [username]);
+
+  // Theme persistence
   useEffect(() => {
     localStorage.setItem("theme", theme);
     document.documentElement.setAttribute("data-theme", theme);
   }, [theme]);
 
-  useEffect(() => { localStorage.setItem("username", username); }, [username]);
-
-  /* ---- Check auth on mount ---- */
+  // Username persistence & Yjs Awareness sync
   useEffect(() => {
-    const token = localStorage.getItem("auth_token");
-    if (!token) { setAuthLoading(false); return; }
-    axios.get(`${API_BASE_URL}/auth/me`, { headers: { Authorization: `Bearer ${token}` } })
-      .then((res) => {
-        setAuthUser(res.data.user);
-        setUsername(res.data.user.username);
-        setAuthMode("none");
-      })
-      .catch(() => { localStorage.removeItem("auth_token"); })
-      .finally(() => setAuthLoading(false));
-  }, []);
+    localStorage.setItem("username", username);
+    if (username && joinedRoomId) {
+      setAwarenessUser(
+        username,
+        authUser?.role || (isHost ? "interviewer" : "candidate"),
+        null,
+        authUser?._id || socket.id
+      );
+    }
+  }, [username, joinedRoomId, authUser, isHost]);
 
-  /* ---- URL room param ---- */
+  // Auth check + auto-join on mount
   useEffect(() => {
-    const q = new URLSearchParams(window.location.search).get("room");
-    if (q) setRoomId(q);
-  }, []);
+    const safetyTimer = setTimeout(() => {
+      setAuthLoading(false);
+    }, 5000);
 
-  /* ---- Socket listeners ---- */
+    try {
+      const q = new URLSearchParams(window.location.search).get("room");
+      if (q) setRoomId(q);
+
+      const doAutoJoin = (roomIdToJoin, userNameToJoin) => {
+        axios
+          .post(
+            `${API_BASE_URL}/room/join`,
+            { roomId: roomIdToJoin, username: userNameToJoin },
+            { headers: getAuthHeaders(), timeout: 5000 }
+          )
+          .then((res) => {
+            if (userNameToJoin) {
+              setUsername(userNameToJoin);
+              usernameRef.current = userNameToJoin;
+            }
+            syncRoomState(res.data);
+            emitJoinRoom(res.data.roomId, userNameToJoin);
+            setSessionMessage(`Joined room ${res.data.roomId}`);
+          })
+          .catch((err) => {
+            setSessionMessage(err.response?.data?.message || "Unable to join room");
+          });
+      };
+
+      const token = localStorage.getItem("auth_token");
+      if (!token) {
+        setAuthLoading(false);
+        const storedName = localStorage.getItem("username");
+        if (q && storedName && storedName.trim()) {
+          setAuthMode("none");
+          doAutoJoin(q, storedName.trim());
+        } else if (q) {
+          setAuthMode("login");
+        }
+        return;
+      }
+
+      axios
+        .get(`${API_BASE_URL}/auth/me`, {
+          headers: { Authorization: `Bearer ${token}` },
+          timeout: 5000
+        })
+        .then((res) => {
+          setAuthUser(res.data.user);
+          setUsername(res.data.user.username);
+          setAuthMode("none");
+          if (q) doAutoJoin(q, res.data.user.username);
+        })
+        .catch(() => {
+          localStorage.removeItem("auth_token");
+          const storedName = localStorage.getItem("username");
+          if (q && storedName && storedName.trim()) {
+            setAuthMode("none");
+            doAutoJoin(q, storedName.trim());
+          }
+        })
+        .finally(() => {
+          setAuthLoading(false);
+          clearTimeout(safetyTimer);
+        });
+    } catch (err) {
+      console.error(err);
+      setAuthLoading(false);
+      clearTimeout(safetyTimer);
+    }
+
+    return () => clearTimeout(safetyTimer);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Socket listeners
   useEffect(() => {
     const onRoomState = (state) => {
+      // DEBUG - remove after fix [Step 1: room-state received]
+      console.log("[DEBUG Step 1] room-state received:", state.roomId, "currentDoc:", !!getYDoc());
+
       setJoinedRoomId(state.roomId);
       setRoomId(state.roomId);
       setRoomHost(state.host || "");
       setQuestion(state.question || "");
-      setCode(state.code || "");
       setLanguage(normalizeLanguage(state.language));
       setUsers(state.users || []);
       setMessages(state.messages || []);
+
+      // Only reset sync state when switching rooms (not re-joining same room)
+      if (joinedRoomIdRef.current !== state.roomId) {
+        setIsSynced(false);
+        setYjsStatus("syncing");
+        if (bindingRef.current) {
+          bindingRef.current.destroy();
+          bindingRef.current = null;
+        }
+      }
+      // NOTE: Do NOT call initYDoc here — syncRoomState (REST join path) already
+      // calls initYDoc with the room's seed code. Calling it again here with empty
+      // string would create a doc before the yjs-sync-full arrives, causing applyFullSync
+      // to silently fail if the doc was not yet initialized when the event fired.
+      // If doc doesn't exist yet (socket-join path without REST), initialize it.
+      if (!getYDoc()) {
+        initYDoc(state.roomId, "", usernameRef.current);
+      }
     };
-    const onCodeUpdate = (p) => setCode(p.code || "");
+
+    const onYjsSyncFull = (data) => {
+      // DEBUG - remove after fix [Step 2: yjs-sync-full received]
+      const u = typeof data === "string" ? data : data?.update;
+      console.log("[DEBUG Step 2] yjs-sync-full received. updateLen:", u?.length, "docExists:", !!getYDoc());
+      applyFullSync(u);
+      const code = getCode();
+      console.log("[DEBUG Step 2] After applyFullSync, code length:", code.length, "preview:", JSON.stringify(code.slice(0, 40)));
+      // After sync, update local code state for Run Code
+      setCode(code);
+      // Signal that sync is complete — the binding useEffect will create/re-evaluate the binding
+      setIsSynced(true);
+      setYjsStatus("synced");
+    };
+
+    const onYjsUpdate = (data) => {
+      // DEBUG - remove after fix [Step 4: yjs-update received from server]
+      const u = typeof data === "string" ? data : data?.update;
+      console.log("[DEBUG Step 4] yjs-update received from server. updateLen:", u?.length);
+      applyRemoteUpdate(u);
+      setCode(getCode());
+    };
+
     const onQuestionUpdate = (q) => setQuestion(q || "");
-    const onUsersUpdate = (u) => setUsers(u || []);
+    const onUsersUpdate = (u) => {
+      setUsers(u || []);
+      broadcastAwareness();
+    };
     const onLanguageUpdate = (l) => setLanguage(normalizeLanguage(l));
-    const onError = (msg) => { setStatus("Error"); setSessionMessage(msg); setStderr(msg); setIsRunning(false); };
-
-    // Cursor events
-    const onCursorUpdate = ({ username: u, position }) => {
-      setRemoteCursors((prev) => ({ ...prev, [u]: position }));
+    const onError = (msg) => {
+      setStatus("Error");
+      setSessionMessage(msg);
+      setStderr(msg);
+      setIsRunning(false);
     };
-    const onCursorRemove = ({ username: u }) => {
-      setRemoteCursors((prev) => { const n = { ...prev }; delete n[u]; return n; });
-    };
-    const onCursorsSync = (cursors) => setRemoteCursors(cursors);
 
-    // Chat events
+    const onYjsAwareness = ({ update }) => {
+      applyAwarenessUpdate(update);
+    };
+
     const onChatUpdate = (msg) => {
       setMessages((prev) => [...prev.slice(-199), msg]);
-      if (!chatOpen) setUnreadCount((c) => c + 1);
+      if (!chatOpenRef.current) setUnreadCount((c) => c + 1);
     };
     const onChatTyping = ({ username: u, isTyping }) => {
       setTypingUsers((prev) =>
@@ -154,53 +299,270 @@ function App() {
       );
     };
 
+    // Chat catchup — merge missed messages without duplicates
+    const onChatCatchup = (missed) => {
+      setMessages((prev) => {
+        const ids = new Set(prev.map((m) => m.id));
+        const novel = missed.filter((m) => !ids.has(m.id));
+        return [...prev, ...novel].slice(-200);
+      });
+    };
+
+    // Graceful disconnect presence
+    const onUserDisconnecting = ({ username: u }) => {
+      setReconnectingUsers((prev) => new Set([...prev, u]));
+    };
+    const onUserReconnected = ({ username: u }) => {
+      setReconnectingUsers((prev) => {
+        const next = new Set(prev);
+        next.delete(u);
+        return next;
+      });
+    };
+
     socket.on("room-state", onRoomState);
-    socket.on("code-update", onCodeUpdate);
+    socket.on("yjs-sync-full", onYjsSyncFull);
+    socket.on("yjs-update", onYjsUpdate);
     socket.on("question-update", onQuestionUpdate);
     socket.on("users-update", onUsersUpdate);
     socket.on("language-update", onLanguageUpdate);
     socket.on("error-message", onError);
-    socket.on("cursor-update", onCursorUpdate);
-    socket.on("cursor-remove", onCursorRemove);
-    socket.on("cursors-sync", onCursorsSync);
+    socket.on("yjs-awareness", onYjsAwareness);
     socket.on("chat-update", onChatUpdate);
     socket.on("chat-typing-update", onChatTyping);
+    socket.on("chat-catchup", onChatCatchup);
+    socket.on("user-disconnecting", onUserDisconnecting);
+    socket.on("user-reconnected", onUserReconnected);
 
     return () => {
       socket.off("room-state", onRoomState);
-      socket.off("code-update", onCodeUpdate);
+      socket.off("yjs-sync-full", onYjsSyncFull);
+      socket.off("yjs-update", onYjsUpdate);
       socket.off("question-update", onQuestionUpdate);
       socket.off("users-update", onUsersUpdate);
       socket.off("language-update", onLanguageUpdate);
       socket.off("error-message", onError);
-      socket.off("cursor-update", onCursorUpdate);
-      socket.off("cursor-remove", onCursorRemove);
-      socket.off("cursors-sync", onCursorsSync);
+      socket.off("yjs-awareness", onYjsAwareness);
       socket.off("chat-update", onChatUpdate);
       socket.off("chat-typing-update", onChatTyping);
+      socket.off("chat-catchup", onChatCatchup);
+      socket.off("user-disconnecting", onUserDisconnecting);
+      socket.off("user-reconnected", onUserReconnected);
     };
-  }, [chatOpen]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /* ---- Update cursor decorations ---- */
+  // Connection status tracking + reconnect re-join
+  const emitJoinRoom = useCallback((rId, uName) => {
+    if (!rId) return;
+    const name = (uName || usernameRef.current || localStorage.getItem("username") || "Guest").trim();
+    console.log(`[DEBUG emitJoinRoom] emitting join-room for roomId: "${rId}", username: "${name}", socketConnected: ${socket.connected}`);
+    socket.emit("join-room", {
+      roomId: rId,
+      username: name,
+      lastSeenMessageId: getLastMessageId()
+    });
+    if (!socket.connected) {
+      const onConnectRetry = () => {
+        console.log(`[DEBUG emitJoinRoom onConnectRetry] socket connected! Retrying join-room for roomId: "${rId}", username: "${name}"`);
+        socket.emit("join-room", {
+          roomId: rId,
+          username: name,
+          lastSeenMessageId: getLastMessageId()
+        });
+      };
+      socket.once("connect", onConnectRetry);
+    }
+  }, [getLastMessageId]);
+
   useEffect(() => {
+    const onConnect = () => {
+      setConnectionStatus("connected");
+      // Re-join room on reconnect
+      const rId = joinedRoomIdRef.current;
+      const uName = usernameRef.current || localStorage.getItem("username") || "Guest";
+      if (rId) {
+        emitJoinRoom(rId, uName);
+        requestResync();
+      }
+    };
+    const onDisconnect = () => {
+      setConnectionStatus("reconnecting");
+    };
+    const onConnectError = () => {
+      setConnectionStatus("disconnected");
+    };
+
+    if (socket.connected) {
+      onConnect();
+    }
+
+    socket.on("connect", onConnect);
+    socket.on("disconnect", onDisconnect);
+    socket.on("connect_error", onConnectError);
+
+    return () => {
+      socket.off("connect", onConnect);
+      socket.off("disconnect", onDisconnect);
+      socket.off("connect_error", onConnectError);
+    };
+  }, [getLastMessageId]);
+
+
+
+  // Chat auto-scroll
+  useEffect(() => {
+    if (chatOpen && chatEndRef.current) {
+      setTimeout(() => {
+        chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      }, 100);
+    }
+  }, [messages, chatOpen]);
+
+  // === Yjs ↔ Monaco binding: created when editor is mounted AND Yjs is synced ===
+  // isSynced MUST be in the deps array so this effect re-fires when sync arrives
+  // AFTER the editor is already mounted (the common case for the joining participant).
+  useEffect(() => {
+    if (!editorMounted || !joinedRoomId) return;
     if (!editorRef.current || !monacoRef.current) return;
-    const decorations = buildCursorDecorations(remoteCursors, monacoRef);
-    decorationsRef.current = editorRef.current.deltaDecorations(decorationsRef.current, decorations);
-  }, [remoteCursors]);
+    if (bindingRef.current) return; // already bound
+    // DEBUG - remove after fix [Step 3: binding effect fired]
+    console.log("[DEBUG Step 3] Binding effect fired. editorMounted:", editorMounted, "joinedRoomId:", joinedRoomId, "isSynced:", isSynced, "docExists:", !!getYDoc());
+    if (!isSynced) {
+      // Yjs full sync not yet received — wait for isSynced to flip
+      // (this effect will re-run when isSynced changes because it's in the deps)
+      console.log("[DEBUG Step 3] Waiting for Yjs sync before creating binding...");
+      return;
+    }
+    setupMonacoBinding();
+  }, [editorMounted, joinedRoomId, isSynced]);
 
-  /* ---- Scroll chat to bottom ---- */
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  /* ================================================================ */
+  /*  Yjs ↔ Monaco binding                                            */
+  /* ================================================================ */
+  function setupMonacoBinding() {
+    // Destroy any existing binding & clean up old content widgets
+    if (bindingRef.current) {
+      if (bindingRef.current.onAwarenessChange) {
+        getAwareness()?.off("change", bindingRef.current.onAwarenessChange);
+      }
+      if (bindingRef.current.cleanupWidgets) {
+        bindingRef.current.cleanupWidgets();
+      }
+      bindingRef.current.destroy();
+      bindingRef.current = null;
+    }
 
-  /* ---- Auth handlers ---- */
+    const ytext = getYText();
+    const editor = editorRef.current;
+    const ydoc = getYDoc();
+    const monaco = monacoRef.current;
+    if (!ytext || !editor || !ydoc || !monaco) {
+      console.log("[setupMonacoBinding] missing dependencies, aborting.");
+      return;
+    }
+
+    const model = editor.getModel();
+    if (!model) {
+      console.log("[setupMonacoBinding] missing model, aborting.");
+      return;
+    }
+
+    // Synchronize Monaco model with Y.Text BEFORE binding to prevent initial delta emission
+    const currentYText = ytext.toString();
+    if (model.getValue() !== currentYText) {
+      model.setValue(currentYText);
+    }
+
+    const awareness = getAwareness();
+    bindingRef.current = new MonacoBinding(
+      ytext,
+      model,
+      new Set([editor]),
+      awareness
+    );
+    console.log("[DEBUG Step 3] MonacoBinding created successfully.");
+
+    // Setup dynamic CSS for cursor selection highlights & vertical lines
+    let styleEl = document.getElementById("y-monaco-awareness-styles");
+    if (!styleEl) {
+      styleEl = document.createElement("style");
+      styleEl.id = "y-monaco-awareness-styles";
+      document.head.appendChild(styleEl);
+    }
+
+function hexToRgba(hexColor, alpha = 0.2) {
+  if (!hexColor) return `rgba(97, 175, 239, ${alpha})`;
+  let c = hexColor.trim();
+  if (c.startsWith("rgba") || c.startsWith("rgb")) return c;
+  if (c.startsWith("#")) c = c.slice(1);
+  if (c.length === 3) c = c.split("").map((x) => x + x).join("");
+  if (c.length === 6) {
+    const num = parseInt(c, 16);
+    return `rgba(${(num >> 16) & 255}, ${(num >> 8) & 255}, ${num & 255}, ${alpha})`;
+  }
+  return `rgba(97, 175, 239, ${alpha})`;
+}
+
+    const updateAwareness = () => {
+      const localClientId = ydoc.clientID;
+      const awarenessClientId = awareness.clientID;
+
+      // Update dynamic selection highlights & vertical caret bar styles for remote peers ONLY
+      let css = "";
+      awareness.getStates().forEach((state, clientID) => {
+        if (clientID !== localClientId && clientID !== awarenessClientId && state.user) {
+          const color = state.user.color || "#61afef";
+          const bgRgba = hexToRgba(color, 0.2); // Soft 20% transparent highlight
+          css += `
+            .yRemoteSelection-${clientID} { background-color: ${bgRgba} !important; }
+            .yRemoteSelectionHead-${clientID} { border-left-color: ${color} !important; background: transparent !important; }
+          `;
+        }
+      });
+      styleEl.innerHTML = css;
+    };
+
+    const cleanupWidgets = () => {};
+
+    awareness.on("change", updateAwareness);
+    updateAwareness();
+
+    bindingRef.current.onAwarenessChange = updateAwareness;
+    bindingRef.current.cleanupWidgets = cleanupWidgets;
+  }
+
+  /* ================================================================ */
+  /*  HANDLERS                                                         */
+  /* ================================================================ */
+
+  function syncRoomState(r) {
+    setJoinedRoomId(r.roomId);
+    setRoomId(r.roomId);
+    setRoomHost(r.host || "");
+    setQuestion(r.question || "");
+    setLanguage(normalizeLanguage(r.language));
+    setUsers(r.users || []);
+    setMessages(r.messages || []);
+    joinedRoomIdRef.current = r.roomId;
+    // Reset sync state — yjs-sync-full will arrive after join-room socket event
+    setIsSynced(false);
+    setYjsStatus("syncing");
+    if (bindingRef.current) {
+      bindingRef.current.destroy();
+      bindingRef.current = null;
+    }
+    initYDoc(r.roomId, r.code || "", usernameRef.current);
+  }
+
+  // Auth
   async function handleAuth(e) {
     e.preventDefault();
     setAuthError("");
     const endpoint = authMode === "register" ? "/auth/register" : "/auth/login";
-    const body = authMode === "register"
-      ? { username: authForm.username, email: authForm.email, password: authForm.password }
-      : { email: authForm.email, password: authForm.password };
+    const body =
+      authMode === "register"
+        ? { username: authForm.username, email: authForm.email, password: authForm.password, role: authForm.role }
+        : { email: authForm.email, password: authForm.password };
     try {
       const res = await axios.post(`${API_BASE_URL}${endpoint}`, body);
       localStorage.setItem("auth_token", res.data.token);
@@ -213,6 +575,23 @@ function App() {
     }
   }
 
+  async function handleGoogleAuth(credential, role) {
+    setAuthError("");
+    try {
+      const res = await axios.post(`${API_BASE_URL}/auth/google`, {
+        credential,
+        role: role || authForm.role || "candidate"
+      });
+      localStorage.setItem("auth_token", res.data.token);
+      setAuthUser(res.data.user);
+      setUsername(res.data.user.username);
+      setAuthMode("none");
+      reconnectSocket();
+    } catch (err) {
+      setAuthError(err.response?.data?.message || "Google authentication failed");
+    }
+  }
+
   function handleLogout() {
     localStorage.removeItem("auth_token");
     setAuthUser(null);
@@ -220,115 +599,160 @@ function App() {
     setJoinedRoomId("");
     setUsers([]);
     setMessages([]);
+    destroyYDoc();
+    if (bindingRef.current) {
+      if (bindingRef.current.cleanupWidgets) {
+        bindingRef.current.cleanupWidgets();
+      }
+      bindingRef.current.destroy();
+      bindingRef.current = null;
+    }
     reconnectSocket();
   }
 
   function handleGuestContinue() {
-    if (!username.trim()) { setAuthError("Enter a name to continue as guest"); return; }
+    if (!username.trim()) {
+      setAuthError("Enter a name to continue as guest");
+      return;
+    }
     setAuthMode("none");
+    const q = new URLSearchParams(window.location.search).get("room");
+    if (q && (!joinedRoomIdRef.current || joinedRoomIdRef.current !== q)) {
+      axios
+        .post(
+          `${API_BASE_URL}/room/join`,
+          { roomId: q, username: username.trim() },
+          { headers: getAuthHeaders(), timeout: 5000 }
+        )
+        .then((res) => {
+          syncRoomState(res.data);
+          emitJoinRoom(res.data.roomId, username.trim());
+          setSessionMessage(`Joined room ${res.data.roomId}`);
+        })
+        .catch((err) => {
+          setSessionMessage(err.response?.data?.message || "Unable to join room");
+        });
+    }
   }
 
-  /* ---- Room handlers ---- */
-  function syncRoomState(r) {
-    setJoinedRoomId(r.roomId); setRoomId(r.roomId); setRoomHost(r.host || "");
-    setQuestion(r.question || ""); setCode(r.code || "");
-    setLanguage(normalizeLanguage(r.language)); setUsers(r.users || []);
-    setMessages(r.messages || []);
-  }
-
+  // Room
   async function handleCreateRoom() {
     const name = authUser?.username || username.trim() || "guest";
     setUsername(name);
     try {
-      const res = await axios.post(`${API_BASE_URL}/room/create`, { username: name, question }, { headers: getAuthHeaders() });
+      const res = await axios.post(
+        `${API_BASE_URL}/room/create`,
+        { username: name, question },
+        { headers: getAuthHeaders() }
+      );
       syncRoomState(res.data);
       window.history.replaceState({}, "", `${window.location.pathname}?room=${res.data.roomId}`);
-      socket.emit("join-room", { roomId: res.data.roomId, username: name });
+      emitJoinRoom(res.data.roomId, name);
       setSessionMessage(`Interview room ${res.data.roomId} is ready`);
-    } catch (err) { setSessionMessage(err.response?.data?.message || "Failed to create room"); }
+    } catch (err) {
+      setSessionMessage(err.response?.data?.message || "Failed to create room");
+    }
   }
 
   async function handleJoinRoom() {
     const name = authUser?.username || username.trim() || "guest";
     setUsername(name);
-    if (!roomId.trim()) { setSessionMessage("Enter a room code to join"); return; }
+    if (!roomId.trim()) {
+      setSessionMessage("Enter a room code to join");
+      return;
+    }
     try {
-      const res = await axios.post(`${API_BASE_URL}/room/join`, { roomId: roomId.trim(), username: name }, { headers: getAuthHeaders() });
+      const res = await axios.post(
+        `${API_BASE_URL}/room/join`,
+        { roomId: roomId.trim(), username: name },
+        { headers: getAuthHeaders() }
+      );
       syncRoomState(res.data);
       window.history.replaceState({}, "", `${window.location.pathname}?room=${res.data.roomId}`);
-      socket.emit("join-room", { roomId: res.data.roomId, username: name });
+      emitJoinRoom(res.data.roomId, name);
       setSessionMessage(`Joined room ${res.data.roomId}`);
-    } catch (err) { setSessionMessage(err.response?.data?.message || "Unable to join room"); }
+    } catch (err) {
+      setSessionMessage(err.response?.data?.message || "Unable to join room");
+    }
   }
 
   async function handleCopyInvite() {
     if (!inviteLink) return;
-    try { await navigator.clipboard.writeText(inviteLink); setSessionMessage("Invite link copied"); }
-    catch { setSessionMessage("Copy the invite link from the address bar"); }
+    try {
+      await navigator.clipboard.writeText(inviteLink);
+      setSessionMessage("Invite link copied");
+    } catch {
+      setSessionMessage("Copy the invite link from the address bar");
+    }
   }
 
   function handleQuestionChange(e) {
-    const q = e.target.value; setQuestion(q);
-    if (canCollaborate && isHost) socket.emit("question-change", { roomId: joinedRoomId, question: q });
+    const q = e.target.value;
+    setQuestion(q);
+    if (!canCollaborate || !joinedRoomId) return;
+    const effectiveUsername = authUser?.username || username;
+    if (roomHost && effectiveUsername && roomHost === effectiveUsername) {
+      socket.emit("question-change", { roomId: joinedRoomId, question: q });
+    }
   }
 
-  function handleCodeChange(nextCode) {
-    const v = nextCode || ""; setCode(v);
-    if (canCollaborate) socket.emit("code-change", { roomId: joinedRoomId, code: v });
-  }
-
+  // Language
   function handleLanguageChange(e) {
-    const l = e.target.value; setLanguage(l);
-    if (canCollaborate) socket.emit("set-language", { roomId: joinedRoomId, language: l });
+    const l = e.target.value;
+    setLanguage(l);
+    const currentRoomId = joinedRoomIdRef.current;
+    if (currentRoomId) socket.emit("set-language", { roomId: currentRoomId, language: l });
   }
 
   async function handleResetCode() {
     if (!joinedRoomId) return;
     try {
       const res = await axios.post(`${API_BASE_URL}/room/reset`, { roomId: joinedRoomId });
-      syncRoomState(res.data); socket.emit("reset-room", { roomId: joinedRoomId });
-      setStatus("Ready"); setStdout(""); setStderr(""); setCompileOutput(""); setSessionMessage("Code editor reset");
-    } catch (err) { setSessionMessage(err.response?.data?.message || "Unable to reset"); }
+      syncRoomState(res.data);
+      socket.emit("reset-room", { roomId: joinedRoomId });
+      setStatus("Ready");
+      setStdout("");
+      setStderr("");
+      setCompileOutput("");
+      setSessionMessage("Code editor reset");
+    } catch (err) {
+      setSessionMessage(err.response?.data?.message || "Unable to reset");
+    }
   }
 
   async function handleRunCode() {
-    setIsRunning(true); setStatus("Running..."); setStdout(""); setStderr(""); setCompileOutput("");
+    setIsRunning(true);
+    setStatus("Running...");
+    setStdout("");
+    setStderr("");
+    setCompileOutput("");
     try {
-      const payload = { sourceCode: code, language, stdin };
+      // Use editor value as source of truth, fallback to Yjs or state
+      const currentCode = editorRef.current?.getValue() || getCode() || code;
+      const payload = { sourceCode: currentCode, language, stdin };
       if (joinedRoomId) payload.roomId = joinedRoomId;
       const res = await axios.post(`${API_BASE_URL}/code/run`, payload);
-      setStatus(res.data.status || "Done"); setStdout(res.data.stdout || "");
-      setStderr(res.data.stderr || ""); setCompileOutput(res.data.compileOutput || "");
-    } catch (err) { setStatus("Error"); setStderr(err.response?.data?.message || "Execution failed"); }
-    finally { setIsRunning(false); }
+      setStatus(res.data.status || "Done");
+      setStdout(res.data.stdout || "");
+      setStderr(res.data.stderr || "");
+      setCompileOutput(res.data.compileOutput || "");
+    } catch (err) {
+      setStatus("Error");
+      setStderr(err.response?.data?.message || "Execution failed");
+    } finally {
+      setIsRunning(false);
+    }
   }
 
-  /* ---- Editor mount (cursor tracking) ---- */
   function handleEditorMount(editor, monaco) {
     editorRef.current = editor;
     monacoRef.current = monaco;
-    editor.onDidChangeCursorPosition((e) => {
-      if (!joinedRoomId) return;
-      socket.emit("cursor-move", {
-        roomId: joinedRoomId,
-        position: { line: e.position.lineNumber, column: e.position.column }
-      });
-    });
-    editor.onDidChangeCursorSelection((e) => {
-      if (!joinedRoomId) return;
-      const sel = e.selection;
-      if (sel.startLineNumber === sel.endLineNumber && sel.startColumn === sel.endColumn) return;
-      socket.emit("selection-change", {
-        roomId: joinedRoomId,
-        selection: {
-          startLine: sel.startLineNumber, startColumn: sel.startColumn,
-          endLine: sel.endLineNumber, endColumn: sel.endColumn
-        }
-      });
-    });
+    window.__monaco_editor__ = editor;
+    window.monaco = monaco;
+    setEditorMounted(true);
   }
 
-  /* ---- Chat handlers ---- */
+  // Chat
   function handleSendChat(e) {
     e.preventDefault();
     if (!chatInput.trim() || !joinedRoomId) return;
@@ -352,212 +776,134 @@ function App() {
     if (!chatOpen) setUnreadCount(0);
   }
 
-  /* ---- Auth screen ---- */
-  if (authLoading) {
-    return <div className="app" data-theme={theme}><div className="auth-loading"><div className="spinner" /><p>Loading...</p></div></div>;
+  /* ================================================================ */
+  /*  RENDER                                                           */
+  /* ================================================================ */
+
+  // Landing page
+  if (authMode === "landing") {
+    return <LandingPage setAuthMode={setAuthMode} setAuthForm={setAuthForm} />;
   }
 
-  if (authMode !== "none") {
+  // Auth loading or auth screen
+  if (authLoading || authMode !== "none") {
     return (
-      <div className="app" data-theme={theme}>
-        <div className="auth-backdrop">
-          <div className="auth-card">
-            <h1 className="auth-brand">Interview Pad</h1>
-            <p className="auth-subtitle">Real-time collaborative coding for interviews</p>
-            <div className="auth-tabs">
-              <button className={`auth-tab ${authMode === "login" ? "active" : ""}`} onClick={() => { setAuthMode("login"); setAuthError(""); }}>Sign In</button>
-              <button className={`auth-tab ${authMode === "register" ? "active" : ""}`} onClick={() => { setAuthMode("register"); setAuthError(""); }}>Register</button>
-            </div>
-            {authError && <div className="auth-error">{authError}</div>}
-            <form onSubmit={handleAuth} className="auth-form">
-              {authMode === "register" && (
-                <input type="text" placeholder="Username" value={authForm.username}
-                  onChange={(e) => setAuthForm({ ...authForm, username: e.target.value })}
-                  className="input-field" required minLength={2} maxLength={30} />
-              )}
-              <input type="email" placeholder="Email" value={authForm.email}
-                onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}
-                className="input-field" required />
-              <input type="password" placeholder="Password" value={authForm.password}
-                onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}
-                className="input-field" required minLength={6} />
-              <button type="submit" className="btn-primary auth-submit">
-                {authMode === "register" ? "Create Account" : "Sign In"}
-              </button>
-            </form>
-            <div className="auth-divider"><span>or</span></div>
-            <div className="guest-section">
-              <input type="text" placeholder="Enter a name" value={username}
-                onChange={(e) => setUsername(e.target.value)} className="input-field" maxLength={30} />
-              <button className="btn-secondary" onClick={handleGuestContinue}>Continue as Guest</button>
-            </div>
-          </div>
-        </div>
-      </div>
+      <AuthScreen
+        theme={theme}
+        authMode={authMode}
+        setAuthMode={setAuthMode}
+        authError={authError}
+        setAuthError={setAuthError}
+        authForm={authForm}
+        setAuthForm={setAuthForm}
+        authLoading={authLoading}
+        username={username}
+        setUsername={setUsername}
+        onAuth={handleAuth}
+        onGoogleAuth={handleGoogleAuth}
+        onGuestContinue={handleGuestContinue}
+      />
     );
   }
 
-  /* ---- Main UI ---- */
+  // Main UI
   return (
     <div className="app" data-theme={theme}>
+      {/* ---- Navbar ---- */}
       <header className="navbar">
         <div className="navbar-content">
           <div>
-            <h1 className="brand">Interview Pad</h1>
-            <p className="brand-subtitle">Interviewer writes the question, candidate solves live.</p>
+            <h1 className="brand">Interview Pad </h1>
+            <p className="brand-subtitle">
+              Interviewer writes the question, candidate solves live.
+            </p>
           </div>
           <div className="navbar-actions">
+            {/* Connection status indicator */}
+            <span
+              className={`connection-dot connection-${connectionStatus}`}
+              title={connectionStatus === "connected" ? "Connected" : connectionStatus === "reconnecting" ? "Reconnecting…" : "Disconnected"}
+            />
             {authUser && <span className="user-badge">{authUser.username}</span>}
-            <button className="theme-btn" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-              title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}>{theme === "dark" ? "☀️" : "🌙"}</button>
+            <button
+              className="theme-btn"
+              onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+              title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+            >
+              {theme === "dark" ? <Sun size={16} strokeWidth={2} /> : <Moon size={16} strokeWidth={2} />}
+            </button>
             {authUser ? (
-              <button className="btn-tertiary" onClick={handleLogout}>Logout</button>
+              <button className="btn-tertiary" onClick={handleLogout}>
+                Logout
+              </button>
             ) : (
-              <button className="btn-tertiary" onClick={() => setAuthMode("login")}>Sign In</button>
+              <button className="btn-tertiary" onClick={() => setAuthMode("login")}>
+                Sign In
+              </button>
             )}
           </div>
         </div>
       </header>
 
+      {/* ---- Main content ---- */}
       <main className="container">
-        <aside className="sidebar">
-          <section className="card room-section">
-            <div className="card-heading">
-              <h2 className="section-title">Interview setup</h2>
-              <span className="section-chip">Live</span>
-            </div>
-            {!authUser && (
-              <div className="form-group">
-                <label className="field-label" htmlFor="username">Your name</label>
-                <input id="username" type="text" value={username} onChange={(e) => setUsername(e.target.value)}
-                  placeholder="Interviewer or candidate" maxLength="30" className="input-field" />
-              </div>
-            )}
-            <div className="form-group">
-              <label className="field-label" htmlFor="roomId">Room code</label>
-              <input id="roomId" type="text" value={roomId} onChange={(e) => setRoomId(e.target.value)}
-                placeholder="Paste an interview room code" className="input-field" />
-            </div>
-            <div className="button-group">
-              <button className="btn-primary" onClick={handleCreateRoom}>Start interview</button>
-              <button className="btn-secondary" onClick={handleJoinRoom}>Join room</button>
-            </div>
-            <div className="button-group secondary-actions">
-              <button className="btn-tertiary" onClick={handleCopyInvite} disabled={!inviteLink}>Copy invite</button>
-              <button className="btn-tertiary" onClick={handleResetCode} disabled={!joinedRoomId}>Reset code</button>
-            </div>
-            <div className="session-info">
-              <div className="info-row">
-                <span className="info-label">Session</span>
-                <span className="info-value">{joinedRoomId || "Not joined"}</span>
-              </div>
-              <div className="info-row">
-                <span className="info-label">Role</span>
-                <span className="info-value">{joinedRoomId ? (isHost ? "Interviewer" : "Candidate") : "Visitor"}</span>
-              </div>
-              <div className="info-row">
-                <span className="info-label">Participants</span>
-                <div className="participants-list">
-                  {users.length > 0 ? users.map((p) => (
-                    <span key={p} className="participant-badge" title={p}>{p.slice(0, 1).toUpperCase()}</span>
-                  )) : <span className="info-value">No one yet</span>}
-                </div>
-              </div>
-              {inviteLink && (
-                <div className="invite-link-block">
-                  <span className="info-label">Invite</span>
-                  <span className="invite-link-text">{inviteLink}</span>
-                </div>
-              )}
-            </div>
-          </section>
-          <section className="card problem-section">
-            <div className="card-heading">
-              <h2 className="section-title">Question</h2>
-              <span className="section-chip accent">{isHost ? "Editable" : "Read only"}</span>
-            </div>
-            <textarea value={question} onChange={handleQuestionChange}
-              placeholder="Interviewer: paste the interview question here"
-              className="question-textarea" readOnly={canCollaborate && !isHost} />
-          </section>
-        </aside>
+        <Sidebar
+          authUser={authUser}
+          username={username}
+          setUsername={setUsername}
+          roomId={roomId}
+          setRoomId={setRoomId}
+          joinedRoomId={joinedRoomId}
+          isHost={isHost}
+          users={users}
+          question={question}
+          inviteLink={inviteLink}
+          canCollaborate={canCollaborate}
+          reconnectingUsers={reconnectingUsers}
+          onCreateRoom={handleCreateRoom}
+          onJoinRoom={handleJoinRoom}
+          onCopyInvite={handleCopyInvite}
+          onResetCode={handleResetCode}
+          onQuestionChange={handleQuestionChange}
+        />
 
-        <section className="editor-workspace">
-          <div className="editor-toolbar">
-            <div className="toolbar-left">
-              <select value={language} onChange={handleLanguageChange} className="language-dropdown">
-                {LANGUAGES.map((e) => <option key={e.key} value={e.key}>{e.label}</option>)}
-              </select>
-              <div className="status-indicator">
-                <span className={`status-dot status-${statusClass}`}></span>
-                <span className="status-text">{status}</span>
-              </div>
-            </div>
-            <div className="toolbar-right">
-              {joinedRoomId && (
-                <button className={`btn-chat ${chatOpen ? "active" : ""}`} onClick={toggleChat}>
-                  💬 Chat {unreadCount > 0 && <span className="chat-badge">{unreadCount}</span>}
-                </button>
-              )}
-              <button className="btn-run" onClick={handleRunCode} disabled={isRunning}>
-                {isRunning ? "Running" : "▶ Run code"}
-              </button>
-            </div>
-          </div>
-
-          {sessionMessage && <div className="notice-bar">{sessionMessage}</div>}
-
-          <div className="workspace-grid">
-            <div className={`editor-panel ${chatOpen ? "with-chat" : ""}`}>
-              <div className="editor-section">
-                <Editor height="100%" language={language} value={code} onChange={handleCodeChange}
-                  theme={theme === "dark" ? "vs-dark" : "vs"} onMount={handleEditorMount}
-                  options={{
-                    minimap: { enabled: false }, automaticLayout: true, fontSize: 14,
-                    fontFamily: "'Fira Code', 'Roboto Mono', monospace", lineHeight: 1.6,
-                    wordWrap: "on", padding: { top: 16, bottom: 16 },
-                    scrollBeyondLastLine: false, smoothScrolling: true
-                  }} />
-              </div>
-              <div className="console-section">
-                <div className="console-tabs"><div className="tab-item active"><span>Input</span></div></div>
-                <textarea value={stdin} onChange={(e) => setStdin(e.target.value)}
-                  placeholder="Optional stdin input" className="console-input" />
-                <div className="console-tabs spaced"><div className="tab-item active"><span>Output</span></div></div>
-                <div className="console-output stdout">{stdout || "(no output)"}</div>
-                {stderr && (<><div className="console-tabs spaced"><div className="tab-item error"><span>Errors</span></div></div><div className="console-output stderr">{stderr}</div></>)}
-                {compileOutput && (<><div className="console-tabs spaced"><div className="tab-item warning"><span>Build</span></div></div><div className="console-output compile">{compileOutput}</div></>)}
-              </div>
-            </div>
-
-            {chatOpen && joinedRoomId && (
-              <div className="chat-panel">
-                <div className="chat-header">
-                  <h3>Room Chat</h3>
-                  <button className="chat-close" onClick={toggleChat}>✕</button>
-                </div>
-                <div className="chat-messages">
-                  {messages.map((m) => (
-                    <div key={m.id} className={`chat-msg ${m.sender === "system" ? "system" : m.sender === username ? "own" : ""}`}>
-                      {m.sender !== "system" && <span className="chat-sender">{m.sender}</span>}
-                      <span className="chat-text">{m.text}</span>
-                      <span className="chat-time">{new Date(m.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
-                    </div>
-                  ))}
-                  <div ref={chatEndRef} />
-                </div>
-                {typingUsers.length > 0 && (
-                  <div className="chat-typing">{typingUsers.join(", ")} typing...</div>
-                )}
-                <form className="chat-input-bar" onSubmit={handleSendChat}>
-                  <input type="text" value={chatInput} onChange={handleChatInputChange}
-                    placeholder="Type a message..." className="chat-input" maxLength={2000} />
-                  <button type="submit" className="chat-send" disabled={!chatInput.trim()}>↑</button>
-                </form>
-              </div>
-            )}
-          </div>
-        </section>
+        <EditorPanel
+          theme={theme}
+          language={language}
+          code={code}
+          status={status}
+          statusClass={statusClass}
+          isRunning={isRunning}
+          stdin={stdin}
+          setStdin={setStdin}
+          stdout={stdout}
+          stderr={stderr}
+          compileOutput={compileOutput}
+          sessionMessage={sessionMessage}
+          joinedRoomId={joinedRoomId}
+          chatOpen={chatOpen}
+          unreadCount={unreadCount}
+          connectionStatus={connectionStatus}
+          yjsStatus={yjsStatus}
+          onLanguageChange={handleLanguageChange}
+          onRunCode={handleRunCode}
+          onToggleChat={toggleChat}
+          onEditorMount={handleEditorMount}
+        >
+          {chatOpen && joinedRoomId && (
+            <ChatPanel
+              messages={messages}
+              username={username}
+              chatInput={chatInput}
+              setChatInput={setChatInput}
+              typingUsers={typingUsers}
+              chatEndRef={chatEndRef}
+              onSendChat={handleSendChat}
+              onChatInputChange={handleChatInputChange}
+              onClose={toggleChat}
+            />
+          )}
+        </EditorPanel>
       </main>
     </div>
   );
