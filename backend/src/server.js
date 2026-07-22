@@ -149,10 +149,14 @@ app.get("/health", async (_req, res) => {
   res.json({ status: "ok", rooms: count, uptime: process.uptime() });
 });
 
-if (process.env.NODE_ENV === "production" || fs.existsSync(frontendDist)) {
+if (fs.existsSync(frontendDist) && fs.existsSync(path.join(frontendDist, "index.html"))) {
   app.use(express.static(frontendDist));
   app.get("*", (_req, res) => {
     res.sendFile(path.join(frontendDist, "index.html"));
+  });
+} else {
+  app.get("/", (_req, res) => {
+    res.json({ status: "ok", service: "InterviewPad API & Real-time Backend" });
   });
 }
 
